@@ -254,7 +254,12 @@ class LogAggregator:
         self._output: "queue.Queue[List[Dict[str, Any]]]" = queue.Queue(maxsize=10)
         self._last_flush_at = time.time()
 
-        self._thread = threading.Thread(target=self._worker, daemon=True)
+        import weakref
+        self._thread = threading.Thread(
+            target=self._worker_static, 
+            args=(weakref.ref(self), self._stop, self.flush_interval), 
+            daemon=True
+        )
         self._thread.start()
 
     def add_log(self, log_entry: Dict[str, Any]) -> None:
@@ -325,14 +330,27 @@ class LogAggregator:
 
         return aggregated
 
-    def _worker(self) -> None:
-        while not self._stop.is_set():
-            self._stop.wait(self.flush_interval)
-            if self._stop.is_set():
+    def __del__(self) -> None:
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _worker_static(weak_self, stop_event, flush_interval) -> None:
+        while not stop_event.is_set():
+            stop_event.wait(flush_interval)
+            if stop_event.is_set():
                 break
-            with self._lock:
-                if self._buffer and (time.time() - self._last_flush_at) >= self.flush_interval:
-                    self._flush_locked()
+            agg = weak_self()
+            if agg is None:
+                break
+            with agg._lock:
+                if agg._buffer and (time.time() - agg._last_flush_at) >= flush_interval:
+                    try:
+                        agg._flush_locked()
+                    except Exception:
+                        pass
 
 
 class PerformanceMonitor:
@@ -354,7 +372,12 @@ class PerformanceMonitor:
             "updated_at": _now_iso(),
         }
 
-        self._thread = threading.Thread(target=self._worker, daemon=True)
+        import weakref
+        self._thread = threading.Thread(
+            target=self._worker_static, 
+            args=(weakref.ref(self), self._stop, self._sample_interval), 
+            daemon=True
+        )
         self._thread.start()
 
     def record_log(self, level: str, processing_time_sec: float) -> None:
@@ -384,7 +407,14 @@ class PerformanceMonitor:
         self._stop.set()
         self._thread.join(timeout=2)
 
-    def _worker(self) -> None:
+    def __del__(self) -> None:
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _worker_static(weak_self, stop_event, sample_interval) -> None:
         process = None
         if psutil is not None:
             try:
@@ -393,23 +423,26 @@ class PerformanceMonitor:
             except Exception:
                 process = None
 
-        while not self._stop.is_set():
-            self._stop.wait(self._sample_interval)
-            if self._stop.is_set():
+        while not stop_event.is_set():
+            stop_event.wait(sample_interval)
+            if stop_event.is_set():
                 break
-            with self._lock:
+            monitor = weak_self()
+            if monitor is None:
+                break
+            with monitor._lock:
                 if process is not None:
                     try:
-                        self._metrics["memory_usage_mb"] = process.memory_info().rss / 1024 / 1024
-                        self._metrics["cpu_usage_percent"] = process.cpu_percent(interval=None)
+                        monitor._metrics["memory_usage_mb"] = process.memory_info().rss / 1024 / 1024
+                        monitor._metrics["cpu_usage_percent"] = process.cpu_percent(interval=None)
                     except Exception:
-                        self._metrics["memory_usage_mb"] = None
-                        self._metrics["cpu_usage_percent"] = None
+                        monitor._metrics["memory_usage_mb"] = None
+                        monitor._metrics["cpu_usage_percent"] = None
 
-                elapsed = time.time() - self._start_time
+                elapsed = time.time() - monitor._start_time
                 if elapsed > 0:
-                    self._metrics["throughput_per_sec"] = self._metrics["log_count"] / elapsed
-                self._metrics["updated_at"] = _now_iso()
+                    monitor._metrics["throughput_per_sec"] = monitor._metrics["log_count"] / elapsed
+                monitor._metrics["updated_at"] = _now_iso()
 
 
 class LogArchiver:
@@ -518,7 +551,12 @@ class LogDatabase:
         self._flush_interval = max(0.1, float(flush_interval))
         self._pending: List[tuple] = []
         self._stop = threading.Event()
-        self._flush_thread = threading.Thread(target=self._flush_worker, daemon=True)
+        import weakref
+        self._flush_thread = threading.Thread(
+            target=self._flush_worker_static, 
+            args=(weakref.ref(self), self._stop, self._flush_interval), 
+            daemon=True
+        )
 
         self._init_database()
         self._flush_thread.start()
@@ -607,14 +645,27 @@ class LogDatabase:
         self._conn.commit()
         self._pending.clear()
 
-    def _flush_worker(self) -> None:
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _flush_worker_static(weak_self, stop_event, flush_interval) -> None:
         """后台定时刷新线程"""
-        while not self._stop.is_set():
-            self._stop.wait(self._flush_interval)
-            if self._stop.is_set():
+        while not stop_event.is_set():
+            stop_event.wait(flush_interval)
+            if stop_event.is_set():
                 break
-            with self._lock:
-                self._flush_pending()
+            db = weak_self()
+            if db is None:
+                break
+            with db._lock:
+                try:
+                    db._flush_pending()
+                except Exception:
+                    pass
 
 
     def query_logs(
@@ -675,7 +726,12 @@ class LogStreamProcessor:
         self._input: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=max(1, int(max_queue_size)))
         self._output: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max(1, int(max_queue_size)))
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
+        import weakref
+        self._thread = threading.Thread(
+            target=self._worker_static, 
+            args=(weakref.ref(self), self._stop, self._input, self._output), 
+            daemon=True
+        )
         self._thread.start()
 
     def add_processor(self, processor: Callable[[Dict[str, Any]], Dict[str, Any]]) -> None:
@@ -720,24 +776,41 @@ class LogStreamProcessor:
             return
         _logger.exception("日志处理失败")
 
-    def _worker(self) -> None:
-        while not self._stop.is_set():
+    def __del__(self) -> None:
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _worker_static(weak_self, stop_event, input_queue, output_queue) -> None:
+        import queue
+        while not stop_event.is_set():
             try:
-                item = self._input.get(timeout=0.5)
+                item = input_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             if item is None:
                 break
             processed = item
+            
+            processor = weak_self()
+            if processor is None:
+                break
+                
             try:
-                for p in self.processors:
+                # 获取 processors，避免强引用的锁冲突，在 processors 极少变化时直接使用
+                for p in processor.processors:
                     processed = p(processed)
                 try:
-                    self._output.put_nowait(processed)
+                    output_queue.put_nowait(processed)
                 except queue.Full:
                     pass
             except Exception as e:
-                self._handle_error(e, item)
+                try:
+                    processor._handle_error(e, item)
+                except Exception:
+                    pass
 
 
 class LogAnalyzer:

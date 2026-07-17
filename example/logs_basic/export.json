@@ -1,0 +1,21 @@
+[
+{"file": "basic.log", "line_number": 1, "content": "2026-07-17 15:46:13.734 | DEBUG    | ReqID:req-basic-001 | basic.py:33 | 1628640 | 基础日志: debug", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 2, "content": "2026-07-17 15:46:13.734 | INFO     | ReqID:req-basic-001 | basic.py:34 | 1628640 | 基础日志: info", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 3, "content": "2026-07-17 15:46:13.734 | WARNING  | ReqID:req-basic-001 | basic.py:35 | 1628640 | 基础日志: warning", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 4, "content": "2026-07-17 15:46:13.734 | ERROR    | ReqID:req-basic-001 | basic.py:36 | 1628640 | 基础日志: error", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 5, "content": "2026-07-17 15:46:13.734 | CRITICAL | ReqID:req-basic-001 | basic.py:37 | 1628640 | 基础日志: critical", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 6, "content": "2026-07-17 15:46:13.734 | INFO     | ReqID:req-basic-001 | basic.py:40 | 1628640 | [BOOT] 服务启动完成", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 7, "content": "2026-07-17 15:46:13.735 | WARNING  | ReqID:req-basic-001 | basic.py:41 | 1628640 | [CONFIG] 配置项缺失，使用默认值", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 8, "content": "2026-07-17 15:46:13.735 | INFO     | ReqID:req-basic-001 | basic.py:42 | 1628640 | 分类: AUTH - 用户登录成功", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 9, "content": "2026-07-17 15:46:13.735 | ERROR    | ReqID:req-basic-001 | basic.py:43 | 1628640 | 分类: DB - 数据库连接超时", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 10, "content": "2026-07-17 15:46:13.735 | INFO     | ReqID:req-basic-001 | basic.py:44 | 1628640 | [/home/wzb/yyds_github/yyds-logger/example/basic.py:44:run_basic] 带位置信息的日志", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 11, "content": "2026-07-17 15:46:13.736 | INFO     | ReqID:req-basic-001 | basic.py:47 | 1628640 | API 请求处理 | user_id=123 | method=POST | path=/api/orders | ip=192.168.1.100", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 12, "content": "2026-07-17 15:46:13.736 | INFO     | ReqID:req-basic-001 | basic.py:53 | 1628640 | 请求耗时分解 | db_query=0.023s | cache_lookup=0.002s | serialization=0.005s | total=0.081s", "timestamp": "2026-07-17T15:46:13"},
+{"file": "basic.log", "line_number": 13, "content": "2026-07-17 15:46:14.816 | INFO     | ReqID:req-analysis | basic.py:210 | 1628640 | 分析测试日志 #0", "timestamp": "2026-07-17T15:46:14"},
+{"file": "basic.log", "line_number": 14, "content": "2026-07-17 15:46:14.816 | INFO     | ReqID:req-analysis | basic.py:210 | 1628640 | 分析测试日志 #1", "timestamp": "2026-07-17T15:46:14"},
+{"file": "basic.log", "line_number": 15, "content": "2026-07-17 15:46:14.816 | INFO     | ReqID:req-analysis | basic.py:210 | 1628640 | 分析测试日志 #2", "timestamp": "2026-07-17T15:46:14"},
+{"file": "basic.log", "line_number": 16, "content": "2026-07-17 15:46:14.816 | INFO     | ReqID:req-analysis | basic.py:210 | 1628640 | 分析测试日志 #3", "timestamp": "2026-07-17T15:46:14"},
+{"file": "basic.log", "line_number": 17, "content": "2026-07-17 15:46:14.816 | INFO     | ReqID:req-analysis | basic.py:210 | 1628640 | 分析测试日志 #4", "timestamp": "2026-07-17T15:46:14"},
+{"file": "basic.log", "line_number": 18, "content": "2026-07-17 15:46:14.817 | ERROR    | ReqID:req-analysis | basic.py:211 | 1628640 | 模拟 ConnectionError 异常", "timestamp": "2026-07-17T15:46:14"},
+{"file": "basic.log", "line_number": 19, "content": "2026-07-17 15:46:14.817 | WARNING  | ReqID:req-analysis | basic.py:212 | 1628640 | 模拟 DeprecationWarning 警告", "timestamp": "2026-07-17T15:46:14"}
+]

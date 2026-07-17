@@ -45,7 +45,6 @@ setup(
         "Operating System :: OS Independent",
     ],
     install_requires=[
-        "loguru>=0.7.3",
     ],
     extras_require={
         # 远程日志收集：异步优先（aiohttp），同步回退（requests）

@@ -24,7 +24,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 import threading
 
-from loguru import logger
+from .yyds_loguru import create_logger, logger
 
 
 class YydsLogger:
@@ -187,9 +187,6 @@ class YydsLogger:
         }
     }
 
-    # 多实例防御：loguru 为全局单例，统计同进程内活跃实例数
-    _instances_lock = threading.Lock()
-    _active_instances = 0
 
     def __init__(
         self,
@@ -211,7 +208,7 @@ class YydsLogger:
         adaptive_level: bool = False,          # 新增：自适应日志级别
         performance_mode: bool = False,        # 新增：性能模式
         enable_exception_hook: bool = False,
-        env: Optional[str] = None,             # 新增：环境，'dev'/'prod'（优先于 work_type）
+        env: Optional[str] = 'prod',             # 新增：环境，'dev'/'prod'（优先于 work_type）
         enqueue: Optional[bool] = None,        # 新增：显式覆盖 enqueue
         diagnose: Optional[bool] = None,       # 新增：显式覆盖 diagnose
         backtrace: Optional[bool] = None,      # 新增：显式覆盖 backtrace
@@ -259,6 +256,7 @@ class YydsLogger:
             env = os.getenv("YYDS_LOG_ENV", env)
 
         self.file_name = file_name
+        self._config_lock = threading.RLock()
         self.log_dir = log_dir
         self.max_size = max_size
         self.retention = retention
@@ -310,12 +308,13 @@ class YydsLogger:
         self.language = language if language in ('zh', 'en') else 'zh'
 
         # 定义上下文变量，用于存储 request_id
-        self.request_id_var = ContextVar("request_id", default="no-request-id")
+        self.request_id_var = ContextVar("request_id", default="-")
 
         # 使用 patch 确保每条日志记录都包含 'request_id'
-        self.logger = logger.patch(
+        self._raw_logger = create_logger(stderr=False, register_atexit=False)
+        self.logger = self._raw_logger.patch(
             lambda record: record["extra"].update(
-                request_id=self.request_id_var.get() or "no-request-id"
+                request_id=self.request_id_var.get() or "-"
             )
         )
         # 缓存常用的 opt(depth=1)，减少热路径对象创建开销
@@ -393,22 +392,7 @@ class YydsLogger:
             except Exception:
                 pass
 
-        # 多实例防御告警：loguru 全局单例，多个活跃实例的 handler 会互相叠加导致日志重复
         self._instance_counted = False
-        try:
-            with YydsLogger._instances_lock:
-                YydsLogger._active_instances += 1
-                self._instance_counted = True
-                active = YydsLogger._active_instances
-            if active > 1:
-                import warnings
-                warnings.warn(
-                    self._msg('WARN_MULTIPLE_INSTANCES'),
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        except Exception:
-            pass
 
     @staticmethod
     def _env_bool(name: str, default: bool) -> bool:
@@ -558,7 +542,11 @@ class YydsLogger:
 
     def configure_logger(self) -> None:
         """配置日志记录器，添加错误处理和安全性检查"""
-        # 先做只读校验与目录检查：非法配置必须在改动任何全局 logger 状态之前快速失败，
+        with self._config_lock:
+            self._configure_logger()
+
+    def _configure_logger(self) -> None:
+        # 先做只读校验与目录检查：“非法配置在改动全局状态前快速失败”逻辑现已内聚在独立实例中。
         # 否则失败实例会残留 fallback handler，污染后续所有 logger（曾导致重复输出）。
         self._validate_config()
         self._ensure_log_directory()
@@ -1040,7 +1028,7 @@ class YydsLogger:
             "file": file_path,
             "line": log_entry.get("line"),
             "function": log_entry.get("function"),
-            "request_id": log_entry.get("extra", {}).get("request_id", "no-request-id"),
+            "request_id": log_entry.get("extra", {}).get("request_id", "-"),
         }
 
     def remote_sink(self, message):
@@ -1145,10 +1133,17 @@ class YydsLogger:
                     level_name = record.levelno
                 # loguru 官方推荐的调用深度计算：从 emit 自身帧向上跳过所有 logging 内部帧，
                 # 精确定位到真实调用处（旧式 logging.currentframe() 会落在 logging 内部）。
-                frame, depth = inspect.currentframe(), 0
-                while frame and (depth == 0 or frame.f_code.co_filename == log_module.__file__):
-                    frame = frame.f_back
-                    depth += 1
+                try:
+                    frame = sys._getframe(6)
+                    depth = 6
+                    while frame and frame.f_code.co_filename == log_module.__file__:
+                        frame = frame.f_back
+                        depth += 1
+                except ValueError:
+                    frame, depth = inspect.currentframe(), 0
+                    while frame and (depth == 0 or frame.f_code.co_filename == log_module.__file__):
+                        frame = frame.f_back
+                        depth += 1
                 bound_logger.opt(depth=depth, exception=record.exc_info).log(
                     level_name, record.getMessage()
                 )
@@ -1253,7 +1248,7 @@ class YydsLogger:
 
     def set_request_id(self, request_id: str):
         """设置当前上下文的 request_id，返回 token（可用于 reset）"""
-        return self.request_id_var.set(request_id or "no-request-id")
+        return self.request_id_var.set(request_id or "-")
 
     def get_request_id(self) -> str:
         """获取当前上下文的 request_id"""
@@ -2073,12 +2068,12 @@ class YydsLogger:
                 self._update_logger_level()
 
     def _update_logger_level(self) -> None:
-        """更新日志记录器级别。
+        """更新日志记录器级别。"""
+        with self._config_lock:
+            self._update_logger_level_unlocked()
 
-        - 自适应模式（_use_level_filter=True）：sink 使用动态 filter，改级别只需更新
-          _min_level_no（O(1)），不重建任何 handler，避免队列/信号灯反复创建（核心优化）。
-        - 非自适应（如性能模式显式切换）：才重建 handler，这类调用很少。
-        """
+    def _update_logger_level_unlocked(self) -> None:
+        """更新日志记录器级别（未加锁内部实现）。"""
         self._min_level_no = self._safe_level_no(self.filter_level)
         if self._use_level_filter:
             return
@@ -2093,36 +2088,38 @@ class YydsLogger:
 
         进入前会记录原始状态，disable 时精确恢复（而非硬编码 INFO）。
         """
-        if self.performance_mode:
-            return
-        # 记录进入性能模式前的真实状态，便于精确恢复
-        self._pre_perf_state = {
-            'filter_level': self.filter_level,
-            'enable_stats': self.enable_stats,
-            'cache_size': self._cache_size,
-        }
-        self.performance_mode = True
-        # 减少日志输出
-        self.filter_level = "WARNING"
-        self._update_logger_level()
-        # 增加缓存大小
-        self._cache_size = min(self._cache_size * 2, 2048)
-        # 禁用详细统计
-        self.enable_stats = False
+        with self._config_lock:
+            if self.performance_mode:
+                return
+            # 记录进入性能模式前的真实状态，便于精确恢复
+            self._pre_perf_state = {
+                'filter_level': self.filter_level,
+                'enable_stats': self.enable_stats,
+                'cache_size': self._cache_size,
+            }
+            self.performance_mode = True
+            # 减少日志输出
+            self.filter_level = "WARNING"
+            self._update_logger_level_unlocked()
+            # 增加缓存大小
+            self._cache_size = min(self._cache_size * 2, 2048)
+            # 禁用详细统计
+            self.enable_stats = False
 
     def disable_performance_mode(self) -> None:
         """禁用性能模式，恢复到进入前的原始状态。"""
-        if not self.performance_mode:
-            return
-        self.performance_mode = False
-        prev = getattr(self, '_pre_perf_state', None) or {}
-        # 恢复日志级别（无记录时回退到 INFO 以兼容旧行为）
-        self.filter_level = prev.get('filter_level', "INFO")
-        self._update_logger_level()
-        # 恢复缓存大小与统计开关
-        self._cache_size = prev.get('cache_size', max(self._cache_size // 2, 128))
-        self.enable_stats = prev.get('enable_stats', True)
-        self._pre_perf_state = None
+        with self._config_lock:
+            if not self.performance_mode:
+                return
+            self.performance_mode = False
+            prev = getattr(self, '_pre_perf_state', None) or {}
+            # 恢复日志级别（无记录时回退到 INFO 以兼容旧行为）
+            self.filter_level = prev.get('filter_level', "INFO")
+            self._update_logger_level_unlocked()
+            # 恢复缓存大小与统计开关
+            self._cache_size = prev.get('cache_size', max(self._cache_size // 2, 128))
+            self.enable_stats = prev.get('enable_stats', True)
+            self._pre_perf_state = None
 
     def compress_logs(self, days_old: int = 7) -> None:
         """压缩指定天数之前的【已轮转】日志文件。
@@ -2414,6 +2411,10 @@ class YydsLogger:
 
         此方法是幂等的，多次调用安全（atexit + 手动调用不会冲突）。
         """
+        with self._config_lock:
+            self._cleanup()
+
+    def _cleanup(self) -> None:
         if getattr(self, '_cleaned_up', False):
             return
         self._cleaned_up = True
@@ -2461,13 +2462,5 @@ class YydsLogger:
         # wait=True: 等待 enqueue 队列排空，确保信号灯正确释放
         self._remove_handlers(wait=True)
         self.clear_caches()
-        # 多实例计数递减
-        if getattr(self, '_instance_counted', False):
-            try:
-                with YydsLogger._instances_lock:
-                    YydsLogger._active_instances = max(0, YydsLogger._active_instances - 1)
-            except Exception:
-                pass
-            self._instance_counted = False
         _logger = logging.getLogger(__name__)
         _logger.info(self._msg('CLEANUP_COMPLETED'))

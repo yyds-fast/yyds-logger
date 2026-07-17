@@ -6,16 +6,18 @@
 
 - 多语言输出（zh/en）
 - 自定义格式、级别过滤、按大小或按时间轮转、保留策略、压缩
+- **多实例物理隔离**：底层内聚了完全独立的 `yyds_loguru` 引擎，彻底打破全局单例限制。每个 `YydsLogger` 实例拥有独立的 Core，且 `contextualize()` 上下文绑定同样物理隔离，互不串扰。
 - **JSON 结构化输出（serialize）**：直接对接 ELK / Loki / Datadog / CloudWatch
-- **接管标准库 logging**：把 uvicorn / sqlalchemy / requests 等三方库日志统一汇入本管道
-- **环境感知（env=dev/prod）**：生产自动关闭 diagnose/backtrace，保持非阻塞写入
+- **接管标准库 logging**：把 uvicorn / sqlalchemy / requests 等三方库日志统一汇入本管道（通过 `sys._getframe` C 级原生帧跳过深度优化性能）
+- **环境感知（env='prod'/'dev'）**：默认为 `'prod'` (生产环境优先)，生产自动关闭 diagnose/backtrace，保持非阻塞高吞吐写入
 - **按 sink 独立级别**：控制台、主文件、错误文件可各自设级别
 - request_id 上下文注入（ContextVar）+ `bind/contextualize` 结构化字段与 trace 关联
 - 装饰器记录函数调用与耗时（同步/异步），级别关闭时自动跳过昂贵格式化
 - 远程日志上报（默认仅 ERROR 及以上，异步发送避免阻塞，带队列背压保护）
 - 基础统计（按级别/分类/小时）、缓存性能信息
 - 日志管理（压缩、归档、清理，自动跳过活跃文件）、简单分析与导出
-- **生产友好**：核心仅依赖 loguru；SIGTERM 优雅排空；自适应级别零 handler 重建
+- **纯零核心依赖**：移除了对外部 `loguru` 包的硬性安装依赖，基础版零额外依赖，轻量可靠且彻底杜绝依赖版本冲突风险
+- **优雅资源管理**：SIGTERM 优雅排空；自适应级别零 handler 重建；后台线程引用弱化设计，无内存/线程泄漏风险
 
 ## 安装
 
@@ -23,7 +25,7 @@
 pip install -U yyds_logger
 ```
 
-核心安装只依赖 `loguru`。按需安装可选能力：
+核心安装为**纯零额外依赖**（移除了对外部 loguru 的强制依赖，无版本冲突风险）。按需安装可选能力：
 
 ```bash
 pip install "yyds_logger[remote]"    # 远程日志上报（aiohttp + requests）
@@ -114,14 +116,14 @@ asyncio.run(main())
 
 ### 生产环境推荐配置（env）
 
-`env` 优先于旧的 `work_type`。生产模式会关闭 `diagnose/backtrace`（避免在日志里泄漏变量值并降低开销），
+`env` 优先于旧的 `work_type`。**默认值已调整为 `'prod'`**。生产模式会关闭 `diagnose/backtrace`（避免在日志里泄漏变量值并降低开销），
 同时保持 `enqueue=True`（异步非阻塞写入）：
 
 ```python
 logger = YydsLogger(
     file_name="app",
     log_dir="logs",
-    env="prod",            # dev / prod；生产关闭诊断回溯，保持非阻塞
+    # env="prod",          # 默认即为 "prod"，生产关闭诊断回溯，保持非阻塞
     serialize=True,        # 文件输出 JSON，便于日志平台采集
     filter_level="INFO",   # 生产通常 INFO 起步
 )
@@ -133,7 +135,7 @@ logger = YydsLogger(
 logger = YydsLogger("app", env="prod", diagnose=True)  # 临时排障：单独打开 diagnose
 ```
 
-> 兼容性：不传 `env` 时 `work_type` 行为完全不变（`False`=测试，`True`=旧生产）。
+> 兼容性：不显式传 `env` 且不传 `work_type` 时，默认使用安全生产配置。如果传入了 `work_type`，行为完全与旧版本保持兼容（`False`=测试，`True`=旧生产）。
 
 ### JSON 结构化日志（serialize）
 
