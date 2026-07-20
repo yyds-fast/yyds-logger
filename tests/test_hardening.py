@@ -9,6 +9,7 @@ import pytest
 
 from yyds_logger import LogHealthChecker, YydsLogger
 from yyds_logger.i18n import LANG_MAP
+from yyds_logger.profiling import _trace_sync
 
 
 def test_cleanup_drains_current_instance(tmp_path):
@@ -123,6 +124,132 @@ def test_reconfigure_and_cleanup_are_idempotent(tmp_path):
     content = (tmp_path / "reconfigure.log").read_text(encoding="utf-8")
     assert "before-reconfigure" in content
     assert "after-reconfigure" in content
+
+
+def test_cleanup_can_retry_after_failure(tmp_path, monkeypatch):
+    logger = YydsLogger("cleanup-retry", log_dir=str(tmp_path), error_file=False,
+                        enqueue=False)
+    original_remove = logger._remove_handlers
+    failed = {"once": False}
+
+    def fail_once(wait=False):
+        if not failed["once"]:
+            failed["once"] = True
+            raise RuntimeError("synthetic cleanup failure")
+        return original_remove(wait=wait)
+
+    monkeypatch.setattr(logger, "_remove_handlers", fail_once)
+    with pytest.raises(RuntimeError):
+        logger.cleanup()
+    assert logger._cleanup_state == "failed"
+    logger.cleanup()
+    assert logger._cleanup_state == "closed"
+
+
+def test_reconfigure_failure_keeps_previous_handlers(tmp_path):
+    logger = YydsLogger("reconfigure-rollback", log_dir=str(tmp_path), error_file=False,
+                        enqueue=False, filter_level="INFO")
+    try:
+        logger.info("before-failure")
+        logger.filter_level = "NOT_A_LEVEL"
+        with pytest.raises(ValueError):
+            logger.configure_logger()
+        assert logger.filter_level == "INFO"
+        logger.info("after-failure")
+    finally:
+        logger.cleanup()
+    content = (tmp_path / "reconfigure-rollback.log").read_text(encoding="utf-8")
+    assert "before-failure" in content
+    assert "after-failure" in content
+
+
+def test_hook_conflict_does_not_retire_working_handlers(tmp_path):
+    owner = YydsLogger(
+        "hook-owner", log_dir=str(tmp_path), error_file=False,
+        enable_exception_hook=True, enqueue=False,
+    )
+    logger = YydsLogger(
+        "hook-rollback", log_dir=str(tmp_path), error_file=False, enqueue=False,
+    )
+    try:
+        logger._exception_hook_enabled = True
+        with pytest.raises(RuntimeError):
+            logger.configure_logger()
+        assert logger._exception_hook_enabled is False
+        logger.info("still-active-after-hook-conflict")
+    finally:
+        logger.cleanup()
+        owner.cleanup()
+    content = (tmp_path / "hook-rollback.log").read_text(encoding="utf-8")
+    assert "still-active-after-hook-conflict" in content
+
+
+def test_closed_logger_rejects_resource_reconfiguration(tmp_path):
+    logger = YydsLogger(
+        "closed", log_dir=str(tmp_path), error_file=False, enqueue=False,
+    )
+    logger.cleanup()
+    with pytest.raises(RuntimeError):
+        logger.configure_logger()
+    with pytest.raises(RuntimeError):
+        logger.capture_std_logging(names=["closed-stdlib"])
+
+
+def test_line_profiling_restores_trace_after_exception(tmp_path):
+    logger = YydsLogger("profiling", log_dir=str(tmp_path), error_file=False,
+                        enqueue=False, console_level="CRITICAL")
+    try:
+        @logger.time_it(line_by_line=True)
+        def failing_function():
+            raise ValueError("profile failure")
+
+        @logger.time_it(line_by_line=True)
+        def successful_function():
+            return 42
+
+        with pytest.raises(ValueError):
+            failing_function()
+        assert successful_function() == 42
+    finally:
+        logger.cleanup()
+
+
+def test_fallback_profilers_can_run_in_independent_threads():
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def profiled():
+        barrier.wait(timeout=2)
+        return threading.get_ident()
+
+    def worker():
+        try:
+            result, _, _, _ = _trace_sync(profiled)
+            results.append(result)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert errors == []
+    assert len(results) == 2
+    assert all(not thread.is_alive() for thread in threads)
+
+
+def test_fallback_profiler_restores_trace_after_exception():
+    previous_trace = sys.gettrace()
+
+    def failing():
+        raise ValueError("fallback profile failure")
+
+    with pytest.raises(ValueError):
+        _trace_sync(failing)
+    assert sys.gettrace() is previous_trace
 
 
 def test_local_sink_queue_configuration(tmp_path):
@@ -242,6 +369,76 @@ def test_std_logging_rejects_invalid_or_duplicate_capture(tmp_path):
         logger.cleanup()
 
 
+def test_std_logging_preserves_existing_handlers_by_default(tmp_path):
+    name = "preserve-handlers"
+    target = logging.getLogger(name)
+    original_handlers = list(target.handlers)
+    custom_handler = logging.NullHandler()
+    target.addHandler(custom_handler)
+    logger = YydsLogger("preserve", log_dir=str(tmp_path), error_file=False)
+    try:
+        logger.capture_std_logging(names=[name], level="WARNING")
+        assert custom_handler in target.handlers
+    finally:
+        logger.cleanup()
+        target.handlers = original_handlers
+
+
+def test_std_logging_deduplicates_names_and_preserves_runtime_handlers(tmp_path):
+    name = "deduplicated-handlers"
+    target = logging.getLogger(name)
+    original_handlers = list(target.handlers)
+    original_level = target.level
+    original_propagate = target.propagate
+    runtime_handler = logging.NullHandler()
+    logger = YydsLogger("deduplicated", log_dir=str(tmp_path), error_file=False)
+    try:
+        logger.capture_std_logging(names=[name, name], level="WARNING")
+        target.addHandler(runtime_handler)
+        logger.cleanup()
+        assert target.handlers == original_handlers + [runtime_handler]
+    finally:
+        logger.cleanup()
+        target.handlers = original_handlers
+        target.setLevel(original_level)
+        target.propagate = original_propagate
+
+
+def test_std_logging_restore_can_retry_after_failure(tmp_path, monkeypatch):
+    name = "stdlib-restore-retry"
+    target = logging.getLogger(name)
+    original_handlers = list(target.handlers)
+    original_level = target.level
+    original_propagate = target.propagate
+    logger = YydsLogger("stdlib-retry", log_dir=str(tmp_path), error_file=False)
+    original_set_level = target.setLevel
+    failed = {"once": False}
+
+    def fail_once(level):
+        if not failed["once"]:
+            failed["once"] = True
+            raise RuntimeError("synthetic stdlib restore failure")
+        return original_set_level(level)
+
+    try:
+        logger.capture_std_logging(names=[name], level="WARNING")
+        monkeypatch.setattr(target, "setLevel", fail_once)
+        with pytest.raises(RuntimeError):
+            logger.cleanup()
+        assert logger._cleanup_state == "failed"
+        logger.cleanup()
+        assert logger._cleanup_state == "closed"
+        assert target.handlers == original_handlers
+        assert target.level == original_level
+        assert target.propagate == original_propagate
+    finally:
+        monkeypatch.setattr(target, "setLevel", original_set_level)
+        logger.cleanup()
+        target.handlers = original_handlers
+        target.setLevel(original_level)
+        target.propagate = original_propagate
+
+
 def test_std_logging_state_is_restored(tmp_path):
     name = "hardening-restore"
     target = logging.getLogger(name)
@@ -280,3 +477,53 @@ def test_global_hooks_are_restored(tmp_path):
     assert threading.excepthook is previous_thread_hook
     assert signal.getsignal(signal.SIGTERM) is previous_signals[signal.SIGTERM]
     assert signal.getsignal(signal.SIGINT) is previous_signals[signal.SIGINT]
+
+
+def test_exception_hook_chains_application_hook(tmp_path):
+    calls = []
+    previous = sys.excepthook
+
+    def application_hook(exc_type, exc_value, exc_traceback):
+        calls.append((exc_type, exc_value))
+
+    sys.excepthook = application_hook
+    logger = YydsLogger("hook-chain", log_dir=str(tmp_path), error_file=False,
+                        enable_exception_hook=True, enqueue=False)
+    try:
+        installed_hook = sys.excepthook
+        logger.configure_logger()
+        assert sys.excepthook is installed_hook
+        error = ValueError("hook-chain")
+        sys.excepthook(ValueError, error, error.__traceback__)
+    finally:
+        logger.cleanup()
+        sys.excepthook = previous
+    assert calls == [(ValueError, error)]
+
+
+def test_cleanup_preserves_application_hooks_installed_later(tmp_path):
+    previous_excepthook = sys.excepthook
+    previous_thread_hook = threading.excepthook
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def later_thread_hook(args):
+        return None
+
+    def later_signal_hook(signum, frame):
+        return None
+
+    logger = YydsLogger(
+        "later-hooks", log_dir=str(tmp_path), error_file=False,
+        enable_exception_hook=True, install_signal_handlers=True, enqueue=False,
+    )
+    try:
+        threading.excepthook = later_thread_hook
+        signal.signal(signal.SIGTERM, later_signal_hook)
+        logger.cleanup()
+        assert threading.excepthook is later_thread_hook
+        assert signal.getsignal(signal.SIGTERM) is later_signal_hook
+    finally:
+        logger.cleanup()
+        sys.excepthook = previous_excepthook
+        threading.excepthook = previous_thread_hook
+        signal.signal(signal.SIGTERM, previous_sigterm)

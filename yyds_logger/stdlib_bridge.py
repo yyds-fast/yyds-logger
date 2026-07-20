@@ -10,7 +10,7 @@ from .i18n import get_message
 
 def capture_std_logging(logger, level: str = "DEBUG",
                         names: Optional[List[str]] = None,
-                        clear_existing: bool = True) -> None:
+                        clear_existing: bool = False) -> None:
     """Install an intercept handler and save the target logger state."""
     if logger._std_logging_state is not None:
         raise RuntimeError(get_message(logger.language, "ERR_STD_CAPTURE_DUPLICATE"))
@@ -21,7 +21,6 @@ def capture_std_logging(logger, level: str = "DEBUG",
     if names is not None:
         if not isinstance(names, (list, tuple)) or not all(isinstance(name, str) for name in names):
             raise TypeError(get_message(logger.language, "ERR_STD_NAMES"))
-    logger._claim_global_resource("stdlib_logging")
     log_module = logging
     bound_logger = logger.logger
 
@@ -47,18 +46,37 @@ def capture_std_logging(logger, level: str = "DEBUG",
             )
 
     handler = _InterceptHandler()
-    targets = [log_module.getLogger(n) for n in names] if names else [log_module.getLogger()]
+    raw_targets = [log_module.getLogger(n) for n in names] if names else [log_module.getLogger()]
+    # The same logger may be named more than once (including aliases for the
+    # root logger). Saving it twice used to restore the intermediate state and
+    # leave our intercept handler installed after cleanup.
+    targets = list({id(target): target for target in raw_targets}.values())
+    logger._claim_global_resource("stdlib_logging")
     saved = []
-    for target in targets:
-        saved.append((target, list(target.handlers), target.level, target.propagate))
-        if clear_existing:
-            target.handlers = [handler]
-        else:
-            target.addHandler(handler)
-        target.setLevel(level_no)
-        if names:
-            target.propagate = False
-    logger._std_logging_state = saved
+    try:
+        for target in targets:
+            saved.append((target, list(target.handlers), target.level, target.propagate))
+            if clear_existing:
+                target.handlers = [handler]
+            else:
+                target.addHandler(handler)
+            target.setLevel(level_no)
+            if names:
+                target.propagate = False
+    except Exception:
+        for target, handlers, old_level, propagate in saved:
+            target.handlers = handlers
+            target.setLevel(old_level)
+            target.propagate = propagate
+        logger._release_global_resource("stdlib_logging")
+        raise
+    logger._std_logging_state = {
+        "targets": saved,
+        "handler": handler,
+        "clear_existing": bool(clear_existing),
+        "level": level_no,
+        "named": bool(names),
+    }
 
 
 def restore_std_logging(logger) -> None:
@@ -66,11 +84,56 @@ def restore_std_logging(logger) -> None:
     state = logger._std_logging_state
     if not state:
         return
-    for target, handlers, level, propagate in state:
+    # Older state shape is accepted so an instance remains cleanable if code
+    # is upgraded while it is alive (for example in a notebook reload).
+    legacy_state = not isinstance(state, dict)
+    if not legacy_state:
+        targets = state["targets"]
+        intercept_handler = state["handler"]
+        clear_existing = state["clear_existing"]
+        captured_level = state["level"]
+        named = state["named"]
+    else:
+        targets = state
+        intercept_handler = None
+        clear_existing = True
+        captured_level = None
+        named = False
+
+    failed_targets = []
+    first_error = None
+    for target, handlers, level, propagate in targets:
         try:
-            target.handlers = handlers
-            target.setLevel(level)
-            target.propagate = propagate
-        except Exception:
-            continue
+            current_handlers = list(target.handlers)
+            if legacy_state:
+                target.handlers = handlers
+            else:
+                additions = [
+                    item for item in current_handlers
+                    if item is not intercept_handler and item not in handlers
+                ]
+                if clear_existing:
+                    target.handlers = handlers + additions
+                else:
+                    # Existing handlers were never removed. Preserve any
+                    # runtime additions/removals and only take out our own.
+                    target.handlers = [
+                        item for item in current_handlers if item is not intercept_handler
+                    ]
+            if captured_level is None or target.level == captured_level:
+                target.setLevel(level)
+            if not named or target.propagate is False:
+                target.propagate = propagate
+        except Exception as exc:
+            failed_targets.append((target, handlers, level, propagate))
+            if first_error is None:
+                first_error = exc
+
+    if failed_targets:
+        if not legacy_state:
+            state["targets"] = failed_targets
+            logger._std_logging_state = state
+        else:
+            logger._std_logging_state = failed_targets
+        raise RuntimeError("Failed to restore standard logging state") from first_error
     logger._std_logging_state = None

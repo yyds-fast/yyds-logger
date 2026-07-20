@@ -50,6 +50,13 @@ class YydsLogger:
 
     _global_resource_lock = threading.RLock()
     _global_resource_owners = {}
+    _CONFIG_FIELDS = (
+        "log_dir", "max_size", "retention", "rotation_time", "custom_format", "language",
+        "filter_level", "compression", "serialize", "console_serialize",
+        "console_level", "file_level", "error_level", "_error_file", "queue_size",
+        "overflow_policy", "queue_timeout", "process_isolation", "_process_file_name",
+        "enqueue", "diagnose", "backtrace", "_exception_hook_enabled",
+    )
 
 
     def __init__(
@@ -162,13 +169,17 @@ class YydsLogger:
         self._handler_ids: List[int] = []
         self._dropped_messages_total = 0
         self._removed_default_handler = False
+        self._cleaned_up = False
+        self._cleanup_state = "open"
         self._exception_hook_enabled = bool(enable_exception_hook)
         self._exception_hook = None
+        self._threading_exception_hook = None
         self._prev_excepthook = None
         self._capture_std_logging = bool(capture_std_logging)
         self._install_signal_handlers = bool(install_signal_handlers)
         self._std_logging_state = None
         self._prev_signal_handlers = {}
+        self._signal_handlers = {}
         self._prev_threading_excepthook = None
 
         # 语言选项
@@ -233,9 +244,6 @@ class YydsLogger:
         }
         self._stats_start_time = datetime.now()
         self._stats_ready = True
-        self._cleaned_up = False
-
-
         # 注册 atexit 钩子，确保程序退出时自动清理 enqueue 队列和信号灯
         atexit.register(self.cleanup)
 
@@ -287,6 +295,19 @@ class YydsLogger:
             owner_ref = self._global_resource_owners.get(resource)
             if owner_ref is not None and owner_ref() is self:
                 self._global_resource_owners.pop(resource, None)
+
+    def _ensure_open(self) -> None:
+        if getattr(self, "_cleanup_state", "open") != "open":
+            raise RuntimeError(self._msg("ERR_LOGGER_CLOSED"))
+
+    def _config_snapshot(self) -> Dict[str, Any]:
+        return {name: getattr(self, name) for name in self._CONFIG_FIELDS}
+
+    def _restore_config(self, snapshot: Dict[str, Any]) -> None:
+        for name, value in snapshot.items():
+            setattr(self, name, value)
+        self._min_level_no = self._safe_level_no(self.filter_level)
+        self._error_level_no = self._level_no(self.error_level) if self._error_file else 10 ** 9
 
     def _safe_level_no(self, name: Any) -> int:
         """安全获取日志级别编号，失败返回 0（最低，等于不过滤）"""
@@ -354,16 +375,24 @@ class YydsLogger:
     def _remove_handlers(self, wait: bool = False) -> None:
         handler_ids = list(self._handler_ids)
         self._handler_ids.clear()
-        self._dropped_messages_total += sum(
-            int(getattr(handler, "dropped_messages", 0))
+        active_handlers = {
+            getattr(handler, "_id", None): handler
             for handler in getattr(self.logger._core, "handlers", {}).values()
             if getattr(handler, "_id", None) in handler_ids
+        }
+        self._dropped_messages_total += sum(
+            int(getattr(handler, "dropped_messages", 0))
+            for handler in active_handlers.values()
         )
 
         # 仅当本实例存在 enqueue 文件 handler 时才需要排空与 gc：
         # 控制台始终非 enqueue；enqueue=False 时没有 multiprocessing 队列/信号灯，
         # 无需 complete()/gc，也避免无意义地等待全局所有 handler。
-        need_drain = bool(wait and handler_ids and getattr(self, 'enqueue', True))
+        # Derive this from the handlers being retired, not the newly edited
+        # ``self.enqueue`` value during reconfiguration.
+        need_drain = bool(
+            wait and any(getattr(handler, "_enqueue", False) for handler in active_handlers.values())
+        )
 
         if need_drain:
             # 在 remove 之前调用 complete()，等待所有 enqueue 队列排空
@@ -401,17 +430,19 @@ class YydsLogger:
     def configure_logger(self) -> None:
         """配置日志记录器，添加错误处理和安全性检查"""
         with self._config_lock:
+            self._ensure_open()
             self._configure_logger()
 
     def _configure_logger(self) -> None:
-        # 先做只读校验与目录检查：“非法配置在改动全局状态前快速失败”逻辑现已内聚在独立实例中。
-        # 否则失败实例会残留 fallback handler，污染后续所有 logger（曾导致重复输出）。
-        self._validate_config()
-        self._ensure_log_directory()
-
+        old_handler_ids = list(self._handler_ids)
+        old_config = getattr(self, "_last_good_config", None)
+        has_previous_config = bool(old_handler_ids and old_config)
+        had_exception_hook = self._exception_hook is not None
+        new_handler_ids = []
         try:
-            # 如果已有 handler（重新配置场景），等待旧队列排空再移除
-            self._remove_handlers(wait=bool(self._handler_ids))
+            # 所有校验必须在修改 handler 之前完成。
+            self._validate_config()
+            self._ensure_log_directory()
             if not self._removed_default_handler:
                 try:
                     self.logger.remove(0)
@@ -427,23 +458,47 @@ class YydsLogger:
             # 配置日志格式
             log_format = self._get_log_format()
             
-            # 添加控制台处理器
+            # 新 handler 先独立构建，旧 handler 在全部成功后再移除。
+            self._handler_ids = []
             self._add_console_handler(log_format)
-            
-            # 添加文件处理器
             self._add_file_handlers(log_format)
-            
-            # 设置异常处理器
+            new_handler_ids = list(self._handler_ids)
+
+            # Hook installation can fail when another instance owns the
+            # process-wide resource. Do it before retiring working handlers so
+            # the old configuration remains usable on failure.
             if self._exception_hook_enabled:
                 self.setup_exception_handler()
 
+            if old_handler_ids:
+                self._handler_ids = old_handler_ids
+                self._remove_handlers(wait=True)
+                self._handler_ids = new_handler_ids
+
             # 重新缓存 opt(depth=1)，确保使用最新的 logger 配置
             self._logger_d1 = self.logger.opt(depth=1)
-            
+            self._last_good_config = self._config_snapshot()
         except Exception as e:
-            # 如果配置失败，使用基本配置
+            # 新 handler 构建失败时，先移除本次新建的 handler。
+            if not new_handler_ids and self._handler_ids != old_handler_ids:
+                new_handler_ids = list(self._handler_ids)
+            if new_handler_ids:
+                self._handler_ids = new_handler_ids
+                self._remove_handlers(wait=False)
+            if not had_exception_hook and self._exception_hook is not None:
+                self._restore_exception_handler()
+                self._release_global_resource("exception_hooks")
+            if has_previous_config:
+                self._restore_config(old_config)
+                self._handler_ids = old_handler_ids
+                self._logger_d1 = self.logger.opt(depth=1)
+                raise
+            if isinstance(e, (ValueError, TypeError)):
+                raise
+            # 初次配置失败时没有旧 handler，只能提供 stderr 后备输出。
+            self._handler_ids = []
             self._fallback_configuration()
-            raise RuntimeError(self._msg('ERR_CONFIG_FAILED', error=str(e)))
+            raise RuntimeError(self._msg('ERR_CONFIG_FAILED', error=str(e))) from e
     
     def _validate_config(self) -> None:
         """验证配置参数"""
@@ -578,8 +633,13 @@ class YydsLogger:
         """
         设置统一的异常处理函数，将未处理的异常记录到日志。
         """
+        self._ensure_open()
         from .lifecycle import setup_exception_handler
         return setup_exception_handler(self)
+
+    def _restore_exception_handler(self) -> None:
+        from .lifecycle import restore_exception_handler
+        return restore_exception_handler(self)
 
     def _get_level_log_path(self, level_name):
         """
@@ -598,7 +658,7 @@ class YydsLogger:
 
     def capture_std_logging(self, level: str = "DEBUG",
                             names: Optional[List[str]] = None,
-                            clear_existing: bool = True) -> None:
+                            clear_existing: bool = False) -> None:
         """接管标准库 logging，把三方库（uvicorn/sqlalchemy/requests 等）日志统一汇入本管道。
 
         Args:
@@ -606,6 +666,7 @@ class YydsLogger:
             names: 仅接管指定 logger 名称列表；None 表示接管 root（全局）。
             clear_existing: 是否清空目标 logger 既有的 handler。
         """
+        self._ensure_open()
         from .stdlib_bridge import capture_std_logging
         return capture_std_logging(self, level=level, names=names,
                                    clear_existing=clear_existing)
@@ -617,6 +678,7 @@ class YydsLogger:
 
     def _setup_signal_handlers(self) -> None:
         """注册 SIGTERM/SIGINT，退出前调用 cleanup 排空 enqueue 队列，避免容器停服丢日志。"""
+        self._ensure_open()
         from .lifecycle import setup_signal_handlers
         return setup_signal_handlers(self)
 
@@ -916,41 +978,37 @@ class YydsLogger:
             self._cleanup()
 
     def _cleanup(self) -> None:
-        if getattr(self, '_cleaned_up', False):
+        if getattr(self, "_cleanup_state", "open") == "closed":
             return
-        self._cleaned_up = True
+        if getattr(self, "_cleanup_state", "open") == "closing":
+            return
+        self._cleanup_state = "closing"
 
-        # 取消 atexit 注册，避免重复调用
+        try:
+            self._restore_exception_handler()
+            self._release_global_resource("exception_hooks")
+
+            self._restore_std_logging()
+            self._release_global_resource("stdlib_logging")
+
+            self._restore_signal_handlers()
+            self._release_global_resource("signal_handlers")
+
+            # wait=True: 等待 enqueue 队列排空，确保信号灯正确释放
+            self._remove_handlers(wait=True)
+        except Exception:
+            self._cleanup_state = "failed"
+            raise
+
+        # Only unregister after every retryable cleanup phase has succeeded.
+        # If a manual cleanup fails, atexit still gets a final chance.
         try:
             atexit.unregister(self.cleanup)
         except Exception:
             pass
-
-        if self._exception_hook and self._prev_excepthook and sys.excepthook is self._exception_hook:
-            try:
-                sys.excepthook = self._prev_excepthook
-            except Exception:
-                pass
-        # 恢复子线程异常钩子
-        if self._prev_threading_excepthook is not None:
-            try:
-                threading.excepthook = self._prev_threading_excepthook
-            except Exception:
-                pass
-            self._prev_threading_excepthook = None
-        # 恢复标准库 logging 与信号处理
+        self._cleaned_up = True
+        self._cleanup_state = "closed"
         try:
-            self._restore_std_logging()
+            logging.getLogger(__name__).info(self._msg('CLEANUP_COMPLETED'))
         except Exception:
             pass
-        try:
-            self._restore_signal_handlers()
-        except Exception:
-            pass
-        self._release_global_resource("stdlib_logging")
-        self._release_global_resource("signal_handlers")
-        self._release_global_resource("exception_hooks")
-        # wait=True: 等待 enqueue 队列排空，确保信号灯正确释放
-        self._remove_handlers(wait=True)
-        _logger = logging.getLogger(__name__)
-        _logger.info(self._msg('CLEANUP_COMPLETED'))

@@ -2,8 +2,30 @@
 
 import inspect
 import sys
+import threading
 from collections import defaultdict
 from time import perf_counter
+
+
+_TRACE_STATE = threading.local()
+
+
+class ProfilingBusyError(RuntimeError):
+    """Raised when another fallback tracer is active in this thread."""
+
+
+def _enter_trace() -> None:
+    # ``sys.settrace()`` is local to the current OS thread.  A process-wide
+    # lock needlessly serialized independent profilers running in different
+    # threads, while still needing to reject overlapping asyncio tasks in the
+    # same thread.
+    if getattr(_TRACE_STATE, "active", False):
+        raise ProfilingBusyError
+    _TRACE_STATE.active = True
+
+
+def _leave_trace() -> None:
+    _TRACE_STATE.active = False
 
 
 def run_sync(logger, func, *args, **kwargs):
@@ -18,7 +40,10 @@ def run_sync(logger, func, *args, **kwargs):
         duration_ms = (perf_counter() - start) * 1000.0
         line_times, line_hits = _extract_stats(profiler.get_stats(), func)
     else:
-        result, duration_ms, line_times, line_hits = _trace_sync(func, *args, **kwargs)
+        try:
+            result, duration_ms, line_times, line_hits = _trace_sync(func, *args, **kwargs)
+        except ProfilingBusyError as exc:
+            raise RuntimeError(logger._msg("ERR_PROFILING_BUSY")) from exc
     print_report(logger, func, duration_ms, line_times, line_hits)
     return result
 
@@ -40,7 +65,10 @@ async def _run_async(logger, func, *args, **kwargs):
         duration_ms = (perf_counter() - start) * 1000.0
         line_times, line_hits = _extract_stats(profiler.get_stats(), func)
     else:
-        result, duration_ms, line_times, line_hits = await _trace_async(func, *args, **kwargs)
+        try:
+            result, duration_ms, line_times, line_hits = await _trace_async(func, *args, **kwargs)
+        except ProfilingBusyError as exc:
+            raise RuntimeError(logger._msg("ERR_PROFILING_BUSY")) from exc
     print_report(logger, func, duration_ms, line_times, line_hits)
     return result
 
@@ -77,13 +105,17 @@ def _trace_sync(func, *args, **kwargs):
                 state["last_line"] = None
         return tracer
 
-    old_trace = sys.gettrace()
-    sys.settrace(tracer)
-    start = perf_counter()
+    _enter_trace()
     try:
-        return_value = func(*args, **kwargs)
+        old_trace = sys.gettrace()
+        sys.settrace(tracer)
+        start = perf_counter()
+        try:
+            return_value = func(*args, **kwargs)
+        finally:
+            sys.settrace(old_trace)
     finally:
-        sys.settrace(old_trace)
+        _leave_trace()
     return return_value, (perf_counter() - start) * 1000.0, line_times, line_hits
 
 
@@ -107,13 +139,17 @@ async def _trace_async(func, *args, **kwargs):
                 state["last_line"] = None
         return tracer
 
-    old_trace = sys.gettrace()
-    sys.settrace(tracer)
-    start = perf_counter()
+    _enter_trace()
     try:
-        result = await func(*args, **kwargs)
+        old_trace = sys.gettrace()
+        sys.settrace(tracer)
+        start = perf_counter()
+        try:
+            result = await func(*args, **kwargs)
+        finally:
+            sys.settrace(old_trace)
     finally:
-        sys.settrace(old_trace)
+        _leave_trace()
     return result, (perf_counter() - start) * 1000.0, line_times, line_hits
 
 

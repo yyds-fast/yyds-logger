@@ -139,7 +139,7 @@ logger = YydsLogger(
 
 ### 多进程配置
 
-多进程部署可使用 `process_isolation=True`，让不同进程写入独立的 PID 日志文件，避免轮转和写入竞争。
+多进程部署必须使用 `process_isolation=True`，让不同进程写入独立的 PID 日志文件，避免轮转和写入竞争；默认值为 `False` 以保持单进程文件名兼容。
 
 本地文件 sink 的 enqueue 队列可通过 `queue_size`、`overflow_policy` 和 `queue_timeout` 配置；
 队列满时可选择阻塞或丢弃，并通过 `get_queue_dropped()` 查看丢弃数量。
@@ -198,7 +198,8 @@ logger = YydsLogger("app", capture_std_logging=True)  # 构造时直接接管 ro
 logger.capture_std_logging(level="INFO", names=["uvicorn", "sqlalchemy.engine"])
 ```
 
-`cleanup()` 时会自动恢复被修改的标准库 logging 状态。
+默认不会删除目标 logger 已有的 handlers；如需完全接管，可显式传入
+`clear_existing=True`。`cleanup()` 时会自动恢复被修改的标准库 logging 状态。
 
 ### 按 sink 设置独立级别
 
@@ -377,7 +378,7 @@ logger = YydsLogger(
     queue_size=10000,                   # 本地 enqueue 队列容量，None 表示无界
     overflow_policy="block",           # 队列满时 block 或 drop
     queue_timeout=None,                 # block 模式最大等待时间
-    process_isolation=False,             # 多进程按 PID 隔离文件名
+    process_isolation=False,             # 多进程部署时必须改为 True
 )
 ```
 
