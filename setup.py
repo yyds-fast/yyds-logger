@@ -68,7 +68,7 @@ setup(
         ],
     },
     project_urls={
-        "Bug Reports": "https://github.com/yyds-fast/yyds_logger/issues",
-        "Source": "https://github.com/yyds-fast/yyds_logger",
+        "Bug Reports": "https://github.com/yyds-fast/yyds-logger/issues",
+        "Source": "https://github.com/yyds-fast/yyds-logger",
     },
 )

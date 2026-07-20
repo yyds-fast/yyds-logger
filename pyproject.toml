@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yyds_logger"
+name = "yyds-logger"
 dynamic = ["version", "readme"]
 description = "An enhanced logger based on Loguru"
 requires-python = ">=3.8"

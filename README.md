@@ -23,15 +23,15 @@
 ## 安装
 
 ```bash
-pip install -U yyds_logger
+pip install -U yyds-logger
 ```
 
 核心安装为**纯零额外依赖**（移除了对外部 loguru 的强制依赖，无版本冲突风险）。按需安装可选能力：
 
 ```bash
-pip install "yyds_logger[profile]"   # 行级耗时分析（line_profiler，更精确）
-pip install "yyds_logger[monitoring]"  # 系统指标与健康检查（psutil）
-pip install "yyds_logger[all]"       # 一次性安装全部可选依赖
+pip install "yyds-logger[profile]"   # 行级耗时分析（line_profiler，更精确）
+pip install "yyds-logger[monitoring]"  # 系统指标与健康检查（psutil）
+pip install "yyds-logger[all]"       # 一次性安装全部可选依赖
 ```
 
 > 未装 `line_profiler` 时，`time_it(line_by_line=True)` 自动回退到原生 `sys.settrace`。
@@ -315,7 +315,7 @@ heavy_task()
 健康检查依赖 `psutil`，可通过可选依赖安装：
 
 ```bash
-pip install yyds_logger[monitoring]
+pip install yyds-logger[monitoring]
 ```
 
 ```python
