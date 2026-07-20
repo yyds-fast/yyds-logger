@@ -7,7 +7,6 @@ import pytest
 from pathlib import Path
 
 from yyds_logger import YydsLogger
-from yyds_logger.advanced_features import LogSecurity, LogDatabase
 
 TEST_DIR = Path(__file__).parent.parent / "test_logs"
 
@@ -57,8 +56,8 @@ def test_multi_instance_isolation():
     assert "This is message A" not in content_b
 
 
-def test_concurrency_and_performance_mode():
-    """测试在高频日志写入下，并发切换性能模式的线程安全与稳定性"""
+def test_concurrency_logging():
+    """测试高频并发日志写入的稳定性"""
     logger = YydsLogger("concurrency_test", log_dir=str(TEST_DIR), error_file=False)
     
     stop_event = threading.Event()
@@ -68,23 +67,12 @@ def test_concurrency_and_performance_mode():
             logger.info("Concurrency stress log message")
             time.sleep(0.001)
 
-    def config_worker():
-        while not stop_event.is_set():
-            logger.enable_performance_mode()
-            time.sleep(0.01)
-            logger.disable_performance_mode()
-            time.sleep(0.01)
-
-    # 启动多个高频写入线程和重配置线程
+    # 启动多个高频写入线程
     threads = []
     for _ in range(5):
         t = threading.Thread(target=log_worker)
         threads.append(t)
         t.start()
-
-    t_cfg = threading.Thread(target=config_worker)
-    threads.append(t_cfg)
-    t_cfg.start()
 
     # 运行压测一段时间
     time.sleep(1.5)
@@ -122,47 +110,6 @@ def test_capture_std_logging():
     assert "This info should NOT be intercepted" not in content
 
 
-def test_log_security():
-    """测试日志敏感信息脱敏及加密工具函数"""
-    # 1. 测试脱敏 (LogSecurity)
-    security = LogSecurity()
-    msg = "My secret token=123456, passwd=abcdefg, User=Admin"
-    sanitized = security.sanitize_message(msg)
-    
-    assert "***" in sanitized
-    assert "123456" not in sanitized
-    assert "abcdefg" not in sanitized
-
-    # 2. 测试嵌套 Mapping 脱敏
-    nested = {"username": "admin", "password": "mypassword", "nested": {"api_key": "mykey"}}
-    sanitized_map = security.sanitize_mapping(nested)
-    assert sanitized_map["username"] == "admin"
-    assert sanitized_map["password"] == "***"
-    assert sanitized_map["nested"]["api_key"] == "***"
-
-
-def test_performance_mode_caching():
-    """测试性能模式下缓存大小调整、过滤级别调升的正确性"""
-    logger = YydsLogger("perf_test", log_dir=str(TEST_DIR), error_file=False)
-    
-    # 获取原始状态
-    orig_level = logger.filter_level
-    orig_cache = logger._cache_size
-
-    # 进入性能模式
-    logger.enable_performance_mode()
-    assert logger.filter_level == "WARNING"
-    assert logger.performance_mode is True
-
-    # 退出性能模式
-    logger.disable_performance_mode()
-    assert logger.filter_level == orig_level
-    assert logger._cache_size == orig_cache
-    assert logger.performance_mode is False
-
-    logger.cleanup()
-
-
 def test_contextualize_isolation():
     """测试不同日志实例之间的 contextualize 上下文完全物理隔离，防止上下文泄漏"""
     logger_a = YydsLogger("logger_a", log_dir=str(TEST_DIR), error_file=False)
@@ -183,4 +130,3 @@ def test_contextualize_isolation():
     # logger_b 的日志文件中不应包含 instance_a_val 变量的值
     assert "instance_a_val" not in content_b
     assert "AAA" not in content_b
-

@@ -41,6 +41,9 @@ class Handler:
         colorize,
         serialize,
         enqueue,
+        queue_size,
+        overflow_policy,
+        queue_timeout,
         multiprocessing_context,
         error_interceptor,
         exception_formatter,
@@ -56,6 +59,14 @@ class Handler:
         self._colorize = colorize
         self._serialize = serialize
         self._enqueue = enqueue
+        self._queue_size = None if queue_size is None else max(1, int(queue_size))
+        self._overflow_policy = str(overflow_policy).lower()
+        self._queue_timeout = queue_timeout
+        if self._overflow_policy not in {"block", "drop"}:
+            raise ValueError("overflow_policy must be 'block' or 'drop'")
+        if self._queue_timeout is not None and float(self._queue_timeout) < 0:
+            raise ValueError("queue_timeout must be >= 0")
+        self._dropped_messages = 0
         self._multiprocessing_context = multiprocessing_context
         self._error_interceptor = error_interceptor
         self._exception_formatter = exception_formatter
@@ -90,11 +101,11 @@ class Handler:
 
         if self._enqueue:
             if self._multiprocessing_context is None:
-                self._queue = multiprocessing.SimpleQueue()
+                self._queue = multiprocessing.Queue(maxsize=self._queue_size or 0)
                 self._confirmation_event = multiprocessing.Event()
                 self._confirmation_lock = multiprocessing.Lock()
             else:
-                self._queue = self._multiprocessing_context.SimpleQueue()
+                self._queue = self._multiprocessing_context.Queue(maxsize=self._queue_size or 0)
                 self._confirmation_event = self._multiprocessing_context.Event()
                 self._confirmation_lock = self._multiprocessing_context.Lock()
             self._queue_lock = create_handler_lock()
@@ -201,7 +212,18 @@ class Handler:
                 if self._stopped:
                     return
                 if self._enqueue:
-                    self._queue.put(str_record)
+                    try:
+                        if self._overflow_policy == "drop":
+                            self._queue.put_nowait(str_record)
+                        elif self._queue_timeout is None:
+                            self._queue.put(str_record)
+                        else:
+                            self._queue.put(str_record, timeout=float(self._queue_timeout))
+                    except Exception as exc:
+                        if exc.__class__.__name__ == "Full":
+                            self._dropped_messages += 1
+                            return
+                        raise
                 else:
                     self._sink.write(str_record)
         except Exception:
@@ -237,6 +259,10 @@ class Handler:
         lock = self._queue_lock if self._enqueue else self._protected_lock()
         with lock:
             return self._sink.tasks_to_complete()
+
+    @property
+    def dropped_messages(self):
+        return self._dropped_messages
 
     def update_format(self, level_id):
         if not self._colorize or self._is_formatter_dynamic:

@@ -8,8 +8,6 @@
 
 from setuptools import setup, find_packages
 from codecs import open
-import glob
-import sys
 import os
 
 
@@ -18,7 +16,7 @@ here = os.path.abspath(os.path.dirname(__file__))
 with open(os.path.join(here, "yyds_logger", "__version__.py"), "r", "utf-8") as f:
     exec(f.read(), about)
 
-with open("README.md", "r", encoding="utf-8") as fh:
+with open(os.path.join(here, "README.md"), "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
@@ -47,27 +45,26 @@ setup(
     install_requires=[
     ],
     extras_require={
-        # 远程日志收集：异步优先（aiohttp），同步回退（requests）
-        "remote": [
-            "aiohttp>=3.13.2",
-            "requests>=2.34.2",
+        "test": [
+            "pytest>=8",
+            "pytest-cov>=5",
+        ],
+        "lint": [
+            "ruff>=0.6",
+            "mypy>=1.10",
         ],
         # 行级耗时分析（time_it(line_by_line=True) 更精确，缺失时自动回退到内置 tracer）
         "profile": [
             "line_profiler>=5.0.2",
         ],
-        # 高级功能模块（脱敏加密、健康检查、性能监控等）
-        "advanced": [
+        # 系统监控与健康检查
+        "monitoring": [
             "psutil>=7.2.2",
-            "cryptography>=48.0.0",
         ],
         # 一次性安装全部可选依赖
         "all": [
-            "aiohttp>=3.13.2",
-            "requests>=2.34.2",
             "line_profiler>=5.0.2",
             "psutil>=7.2.2",
-            "cryptography>=48.0.0",
         ],
     },
     project_urls={
@@ -75,4 +72,3 @@ setup(
         "Source": "https://github.com/yyds-fast/yyds_logger",
     },
 )
-

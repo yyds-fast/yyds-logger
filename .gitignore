@@ -1,5 +1,12 @@
 # Ignore vscode
 /.vscode
+
+# Local AI/Codex/agent workspace state
+/.codex/
+/.agents/
+/.agent/
+/codex/
+/agents/
 /DB
 
 # Byte-compiled / optimized / DLL files
