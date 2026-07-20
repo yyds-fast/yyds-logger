@@ -2,6 +2,9 @@ import logging
 import warnings
 import asyncio
 import json
+import signal
+import sys
+import threading
 import pytest
 
 from yyds_logger import LogHealthChecker, YydsLogger
@@ -54,6 +57,15 @@ def test_invalid_language_and_environment_fail_fast(tmp_path):
         YydsLogger("invalid-env", log_dir=str(tmp_path), env="staging")
 
 
+def test_invalid_queue_configuration_fails_fast(tmp_path):
+    with pytest.raises(TypeError):
+        YydsLogger("zero-queue", log_dir=str(tmp_path), queue_size=0)
+    with pytest.raises(TypeError):
+        YydsLogger("float-queue", log_dir=str(tmp_path), queue_size=1.5)
+    with pytest.raises(ValueError):
+        YydsLogger("bad-timeout", log_dir=str(tmp_path), queue_timeout="never")
+
+
 def test_async_flush_is_available_inside_event_loop(tmp_path):
     async def scenario():
         logger = YydsLogger("async-flush", log_dir=str(tmp_path), error_file=False)
@@ -99,6 +111,20 @@ def test_contextualize_does_not_leak_after_scope(tmp_path):
     assert trace_values == ["scoped", None]
 
 
+def test_reconfigure_and_cleanup_are_idempotent(tmp_path):
+    logger = YydsLogger("reconfigure", log_dir=str(tmp_path), error_file=False,
+                        enqueue=False, filter_level="INFO")
+    logger.info("before-reconfigure")
+    logger.filter_level = "DEBUG"
+    logger.configure_logger()
+    logger.debug("after-reconfigure")
+    logger.cleanup()
+    logger.cleanup()
+    content = (tmp_path / "reconfigure.log").read_text(encoding="utf-8")
+    assert "before-reconfigure" in content
+    assert "after-reconfigure" in content
+
+
 def test_local_sink_queue_configuration(tmp_path):
     logger = YydsLogger(
         "bounded",
@@ -110,8 +136,9 @@ def test_local_sink_queue_configuration(tmp_path):
     try:
         for _ in range(50):
             logger.info("burst")
+        dropped_before_cleanup = logger.get_queue_dropped()
         logger.cleanup()
-        assert logger.get_queue_dropped() >= 0
+        assert logger.get_queue_dropped() == dropped_before_cleanup
         assert (tmp_path / "bounded.log").exists()
     finally:
         logger.cleanup()
@@ -145,6 +172,22 @@ def test_basic_stats_are_returned(tmp_path):
         assert stats["warning"] == 1
         assert stats["error"] == 1
         assert stats["error_rate"] == 1 / 3
+    finally:
+        logger.cleanup()
+
+
+def test_stats_cover_bound_and_contextualized_loggers(tmp_path):
+    logger = YydsLogger("bound-stats", log_dir=str(tmp_path), error_file=False,
+                        enable_stats=True, enqueue=False)
+    try:
+        logger.bind(component="bound").info("bound")
+        with logger.contextualize(component="scoped"):
+            logger.info("contextualized")
+        logger.logger.warning("raw")
+        stats = logger.get_stats()
+        assert stats["total"] == 3
+        assert stats["info"] == 2
+        assert stats["warning"] == 1
     finally:
         logger.cleanup()
 
@@ -210,3 +253,30 @@ def test_std_logging_state_is_restored(tmp_path):
     finally:
         logger.cleanup()
     assert target.level == original_level
+
+
+def test_global_hooks_are_restored(tmp_path):
+    previous_excepthook = sys.excepthook
+    previous_thread_hook = threading.excepthook
+    previous_signals = {
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+    }
+    logger = YydsLogger(
+        "hooks",
+        log_dir=str(tmp_path),
+        error_file=False,
+        enable_exception_hook=True,
+        install_signal_handlers=True,
+        enqueue=False,
+    )
+    try:
+        assert sys.excepthook is not previous_excepthook
+        assert threading.excepthook is not previous_thread_hook
+        assert signal.getsignal(signal.SIGTERM) is not previous_signals[signal.SIGTERM]
+    finally:
+        logger.cleanup()
+    assert sys.excepthook is previous_excepthook
+    assert threading.excepthook is previous_thread_hook
+    assert signal.getsignal(signal.SIGTERM) is previous_signals[signal.SIGTERM]
+    assert signal.getsignal(signal.SIGINT) is previous_signals[signal.SIGINT]

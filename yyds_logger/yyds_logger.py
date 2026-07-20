@@ -133,11 +133,15 @@ class YydsLogger:
         self.file_level = file_level
         self.error_level = error_level or "ERROR"
         self._error_file = bool(error_file)
-        if queue_size is not None and isinstance(queue_size, bool):
-            raise TypeError(get_message(language, "ERR_QUEUE_SIZE"))
-        self.queue_size = None if queue_size is None else max(1, int(queue_size))
+        if queue_size is not None:
+            if isinstance(queue_size, bool) or not isinstance(queue_size, int) or queue_size <= 0:
+                raise TypeError(get_message(language, "ERR_QUEUE_SIZE"))
+        self.queue_size = queue_size
         self.overflow_policy = str(overflow_policy).lower()
-        self.queue_timeout = None if queue_timeout is None else float(queue_timeout)
+        try:
+            self.queue_timeout = None if queue_timeout is None else float(queue_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(get_message(language, "ERR_QUEUE_TIMEOUT")) from exc
         if self.overflow_policy not in {"block", "drop"}:
             raise ValueError(get_message(language, "ERR_OVERFLOW_POLICY"))
         if self.queue_timeout is not None and (
@@ -154,7 +158,9 @@ class YydsLogger:
         self._level_no_cache: Dict[str, int] = {}
         self._error_level_no = 10 ** 9   # 由 configure_logger 精确计算
         self.enable_stats = enable_stats
+        self._stats_ready = False
         self._handler_ids: List[int] = []
+        self._dropped_messages_total = 0
         self._removed_default_handler = False
         self._exception_hook_enabled = bool(enable_exception_hook)
         self._exception_hook = None
@@ -173,11 +179,7 @@ class YydsLogger:
 
         # 使用 patch 确保每条日志记录都包含 'request_id'
         self._raw_logger = create_logger(stderr=False, register_atexit=False)
-        self.logger = self._raw_logger.patch(
-            lambda record: record["extra"].update(
-                request_id=self.request_id_var.get() or "-"
-            )
-        )
+        self.logger = self._raw_logger.patch(self._patch_record)
         # 缓存常用的 opt(depth=1)，减少热路径对象创建开销
         self._logger_d1 = self.logger.opt(depth=1)
 
@@ -230,6 +232,7 @@ class YydsLogger:
             'debug': 0,
         }
         self._stats_start_time = datetime.now()
+        self._stats_ready = True
         self._cleaned_up = False
 
 
@@ -261,6 +264,12 @@ class YydsLogger:
         if raw is None:
             return bool(default)
         return raw.strip().lower() in ('1', 'true', 'yes', 'on', 'y')
+
+    def _patch_record(self, record: Dict[str, Any]) -> None:
+        """Inject request context and collect stats for every logger entry point."""
+        record["extra"].setdefault("request_id", self.request_id_var.get() or "-")
+        if self._stats_ready and self.enable_stats:
+            self._update_stats(record["level"].name)
 
     def _claim_global_resource(self, resource: str) -> None:
         """Prevent multiple instances from silently overwriting process-wide hooks."""
@@ -345,6 +354,11 @@ class YydsLogger:
     def _remove_handlers(self, wait: bool = False) -> None:
         handler_ids = list(self._handler_ids)
         self._handler_ids.clear()
+        self._dropped_messages_total += sum(
+            int(getattr(handler, "dropped_messages", 0))
+            for handler in getattr(self.logger._core, "handlers", {}).values()
+            if getattr(handler, "_id", None) in handler_ids
+        )
 
         # 仅当本实例存在 enqueue 文件 handler 时才需要排空与 gc：
         # 控制台始终非 enqueue；enqueue=False 时没有 multiprocessing 队列/信号灯，
@@ -575,10 +589,12 @@ class YydsLogger:
 
     def get_queue_dropped(self) -> int:
         """返回本实例本地 enqueue sink 因队列满而丢弃的日志数量。"""
-        return sum(
+        current = sum(
             int(getattr(handler, "dropped_messages", 0))
             for handler in getattr(self.logger._core, "handlers", {}).values()
+            if getattr(handler, "_id", None) in self._handler_ids
         )
+        return self._dropped_messages_total + current
 
     def capture_std_logging(self, level: str = "DEBUG",
                             names: Optional[List[str]] = None,
@@ -649,38 +665,24 @@ class YydsLogger:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def log(self, level: str, message: str, *args, **kwargs):
-        if self.enable_stats:
-            self._update_stats(level)
         return self._logger_d1.log(level, message, *args, **kwargs)
 
     def debug(self, message: str, *args, **kwargs):
-        if self.enable_stats:
-            self._update_stats("DEBUG")
         return self._logger_d1.debug(message, *args, **kwargs)
 
     def info(self, message: str, *args, **kwargs):
-        if self.enable_stats:
-            self._update_stats("INFO")
         return self._logger_d1.info(message, *args, **kwargs)
 
     def warning(self, message: str, *args, **kwargs):
-        if self.enable_stats:
-            self._update_stats("WARNING")
         return self._logger_d1.warning(message, *args, **kwargs)
 
     def error(self, message: str, *args, **kwargs):
-        if self.enable_stats:
-            self._update_stats("ERROR")
         return self._logger_d1.error(message, *args, **kwargs)
 
     def critical(self, message: str, *args, **kwargs):
-        if self.enable_stats:
-            self._update_stats("CRITICAL")
         return self._logger_d1.critical(message, *args, **kwargs)
 
     def exception(self, message: str, *args, **kwargs):
-        if self.enable_stats:
-            self._update_stats("ERROR")
         return self._logger_d1.exception(message, *args, **kwargs)
 
     def log_decorator(self, msg=None, level="ERROR", trace=True):
