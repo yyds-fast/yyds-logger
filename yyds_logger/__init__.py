@@ -13,6 +13,7 @@ from .yyds_logger import YydsLogger
 from .health import LogHealthChecker
 
 __all__ = [
+    "__version__",
     "YydsLogger",
     "LogHealthChecker",
 ]

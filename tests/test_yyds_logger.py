@@ -1,4 +1,3 @@
-import os
 import shutil
 import logging
 import threading
@@ -28,8 +27,8 @@ def setup_and_teardown():
 
 def test_multi_instance_isolation():
     """测试多实例日志引擎的完全物理隔离，确保无重复或交叉写入"""
-    logger_a = YydsLogger("logger_a", log_dir=str(TEST_DIR), error_file=False)
-    logger_b = YydsLogger("logger_b", log_dir=str(TEST_DIR), error_file=False)
+    logger_a = YydsLogger("logger_a", log_dir=str(TEST_DIR))
+    logger_b = YydsLogger("logger_b", log_dir=str(TEST_DIR))
 
     logger_a.info("This is message A")
     logger_b.info("This is message B")
@@ -58,7 +57,7 @@ def test_multi_instance_isolation():
 
 def test_concurrency_logging():
     """测试高频并发日志写入的稳定性"""
-    logger = YydsLogger("concurrency_test", log_dir=str(TEST_DIR), error_file=False)
+    logger = YydsLogger("concurrency_test", log_dir=str(TEST_DIR))
     
     stop_event = threading.Event()
 
@@ -91,7 +90,7 @@ def test_concurrency_logging():
 
 def test_capture_std_logging():
     """测试接管标准 Python logging 库日志的正确性"""
-    logger = YydsLogger("intercept_test", log_dir=str(TEST_DIR), error_file=False)
+    logger = YydsLogger("intercept_test", log_dir=str(TEST_DIR))
     
     # 接管特定的 stdlib logger "test_intercept"
     logger.capture_std_logging(level="WARNING", names=["test_intercept"])
@@ -112,8 +111,8 @@ def test_capture_std_logging():
 
 def test_contextualize_isolation():
     """测试不同日志实例之间的 contextualize 上下文完全物理隔离，防止上下文泄漏"""
-    logger_a = YydsLogger("logger_a", log_dir=str(TEST_DIR), error_file=False)
-    logger_b = YydsLogger("logger_b", log_dir=str(TEST_DIR), error_file=False)
+    logger_a = YydsLogger("logger_a", log_dir=str(TEST_DIR))
+    logger_b = YydsLogger("logger_b", log_dir=str(TEST_DIR))
 
     # 仅在 logger_a 的上下文管理器中绑定变量
     with logger_a.contextualize(instance_a_val="AAA"):

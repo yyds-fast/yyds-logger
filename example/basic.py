@@ -23,7 +23,6 @@ def run_basic() -> None:
         log_dir=log_dir,
         language="zh",
         enable_stats=True,
-        rotation_time="1 day",
         compression="gz",
     )
 
@@ -347,7 +346,7 @@ def run_env_prod() -> None:
         file_name="basic_prod",
         log_dir=log_dir,
         language="zh",
-        env="prod",              # 生产模式：关闭 diagnose/backtrace，保持非阻塞
+        env="prod",              # 生产模式：关闭 diagnose/backtrace，使用异步文件写入
         console_level="WARNING", # 控制台只看 WARNING 及以上
         file_level="INFO",       # 文件保留 INFO 全量
     )
@@ -371,8 +370,8 @@ def run_capture_std_logging() -> None:
         file_name="basic_std",
         log_dir=log_dir,
         language="zh",
-        capture_std_logging=True,  # 构造时直接接管 root logger
     )
+    logger.capture_std_logging()  # 显式接管 root logger
 
     # 模拟三方库通过标准库 logging 输出
     third_party = logging.getLogger("third_party.lib")

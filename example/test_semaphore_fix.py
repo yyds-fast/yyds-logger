@@ -12,7 +12,7 @@ warnings.simplefilter("error", UserWarning)
 
 from yyds_logger import YydsLogger
 
-# 使用默认 work_type=False（enqueue=True 场景）
+# 默认 env="prod" 仍使用 enqueue=True。
 log = YydsLogger("test_semaphore", log_dir="/tmp/test_sem_logs")
 
 @log.time_it

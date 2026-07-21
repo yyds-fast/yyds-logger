@@ -84,43 +84,30 @@ def restore_std_logging(logger) -> None:
     state = logger._std_logging_state
     if not state:
         return
-    # Older state shape is accepted so an instance remains cleanable if code
-    # is upgraded while it is alive (for example in a notebook reload).
-    legacy_state = not isinstance(state, dict)
-    if not legacy_state:
-        targets = state["targets"]
-        intercept_handler = state["handler"]
-        clear_existing = state["clear_existing"]
-        captured_level = state["level"]
-        named = state["named"]
-    else:
-        targets = state
-        intercept_handler = None
-        clear_existing = True
-        captured_level = None
-        named = False
+    targets = state["targets"]
+    intercept_handler = state["handler"]
+    clear_existing = state["clear_existing"]
+    captured_level = state["level"]
+    named = state["named"]
 
     failed_targets = []
     first_error = None
     for target, handlers, level, propagate in targets:
         try:
             current_handlers = list(target.handlers)
-            if legacy_state:
-                target.handlers = handlers
+            additions = [
+                item for item in current_handlers
+                if item is not intercept_handler and item not in handlers
+            ]
+            if clear_existing:
+                target.handlers = handlers + additions
             else:
-                additions = [
-                    item for item in current_handlers
-                    if item is not intercept_handler and item not in handlers
+                # Existing handlers were never removed. Preserve any runtime
+                # additions/removals and only take out our own.
+                target.handlers = [
+                    item for item in current_handlers if item is not intercept_handler
                 ]
-                if clear_existing:
-                    target.handlers = handlers + additions
-                else:
-                    # Existing handlers were never removed. Preserve any
-                    # runtime additions/removals and only take out our own.
-                    target.handlers = [
-                        item for item in current_handlers if item is not intercept_handler
-                    ]
-            if captured_level is None or target.level == captured_level:
+            if target.level == captured_level:
                 target.setLevel(level)
             if not named or target.propagate is False:
                 target.propagate = propagate
@@ -130,10 +117,7 @@ def restore_std_logging(logger) -> None:
                 first_error = exc
 
     if failed_targets:
-        if not legacy_state:
-            state["targets"] = failed_targets
-            logger._std_logging_state = state
-        else:
-            logger._std_logging_state = failed_targets
+        state["targets"] = failed_targets
+        logger._std_logging_state = state
         raise RuntimeError("Failed to restore standard logging state") from first_error
     logger._std_logging_state = None

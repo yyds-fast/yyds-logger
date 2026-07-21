@@ -6,13 +6,13 @@
 
 - 多语言输出（zh/en）
 - 所有运行时中英文提示集中维护在 `yyds_logger/i18n.py`
-- 自定义格式、级别过滤、按大小或按时间轮转、保留策略、gzip 压缩
+- 自定义格式、级别过滤、按文件大小轮转、保留策略、gzip 压缩
 - **多实例物理隔离**：底层内聚了完全独立的 `yyds_loguru` 引擎，彻底打破全局单例限制。每个 `YydsLogger` 实例拥有独立的 Core，且 `contextualize()` 上下文绑定同样物理隔离，互不串扰。
 - **JSON 结构化输出（serialize）**：直接对接 ELK / Loki / Datadog / CloudWatch
 - **接管标准库 logging**：把 uvicorn / sqlalchemy 等三方库日志统一汇入本管道（通过 `sys._getframe` C 级原生帧跳过深度优化性能）
-- **环境感知（env='prod'/'dev'）**：默认为 `'prod'` (生产环境优先)，生产自动关闭 diagnose/backtrace，保持非阻塞高吞吐写入
+- **环境感知（env='prod'/'dev'）**：默认为 `'prod'` (生产环境优先)，生产自动关闭 diagnose/backtrace，使用异步文件写入
 - **有界本地队列**：支持 `queue_size`、`block/drop` 溢出策略和 `queue_timeout`
-- **按 sink 独立级别**：控制台、主文件、错误文件可各自设级别
+- **按 sink 独立级别**：控制台、主文件可各自设级别；错误文件固定记录 ERROR 及以上
 - request_id 上下文注入（ContextVar）+ `bind/contextualize` 结构化字段与 trace 关联
 - 装饰器记录函数调用与耗时（同步/异步），级别关闭时自动跳过昂贵格式化
 - 轻量基础统计（总量、级别计数、错误率）
@@ -124,33 +124,31 @@ asyncio.run(main())
 
 ### 生产环境推荐配置（env）
 
-`env` 优先于旧的 `work_type`。**默认值已调整为 `'prod'`**。生产模式会关闭 `diagnose/backtrace`（避免在日志里泄漏变量值并降低开销），
-同时保持 `enqueue=True`（异步非阻塞写入）：
+**默认环境为 `'prod'`**。生产模式会关闭 `diagnose/backtrace`（避免在日志里泄漏变量值并降低开销），
+同时保持 `enqueue=True`（异步文件写入）：
 
 ```python
 logger = YydsLogger(
     file_name="app",
     log_dir="logs",
-    # env="prod",          # 默认即为 "prod"，生产关闭诊断回溯，保持非阻塞
+    # env="prod",          # 默认即为 "prod"，生产关闭诊断回溯，使用异步文件写入
     serialize=True,        # 文件输出 JSON，便于日志平台采集
-    filter_level="INFO",   # 生产通常 INFO 起步
 )
 ```
 
 ### 多进程配置
 
-多进程部署必须使用 `process_isolation=True`，让不同进程写入独立的 PID 日志文件，避免轮转和写入竞争；默认值为 `False` 以保持单进程文件名兼容。
+多进程部署必须使用 `process_isolation=True`，让不同进程写入独立的 PID 日志文件，避免轮转和写入竞争；默认值为 `False`。
 
 本地文件 sink 的 enqueue 队列可通过 `queue_size`、`overflow_policy` 和 `queue_timeout` 配置；
-队列满时可选择阻塞或丢弃，并通过 `get_queue_dropped()` 查看丢弃数量。
+队列满时可选择阻塞或丢弃。默认 `block + queue_timeout=None` 会在队列满时等待，因此异步写入
+不等同于永不阻塞。可通过 `get_queue_dropped()` 或 `get_queue_status()` 查看丢弃数量和当前策略。
 
 如需精细控制，可用 `enqueue` / `diagnose` / `backtrace` 三个可选参数显式覆盖：
 
 ```python
 logger = YydsLogger("app", env="prod", diagnose=True)  # 临时排障：单独打开 diagnose
 ```
-
-> 兼容性：不显式传 `env` 且不传 `work_type` 时，默认使用安全生产配置。如果传入了 `work_type`，行为完全与旧版本保持兼容（`False`=测试，`True`=旧生产）。
 
 ### JSON 结构化日志（serialize）
 
@@ -192,26 +190,39 @@ logger.info(logger.get_request_id())
 把三方库（uvicorn、sqlalchemy、requests 等）通过标准库 `logging` 输出的日志统一汇入本管道：
 
 ```python
-logger = YydsLogger("app", capture_std_logging=True)  # 构造时直接接管 root
+logger = YydsLogger("app")
 
-# 或运行时按需接管指定 logger
+# 按需接管指定 logger；不传 names 时接管 root logger。
 logger.capture_std_logging(level="INFO", names=["uvicorn", "sqlalchemy.engine"])
 ```
 
 默认不会删除目标 logger 已有的 handlers；如需完全接管，可显式传入
 `clear_existing=True`。`cleanup()` 时会自动恢复被修改的标准库 logging 状态。
 
+### 未处理异常
+
+如需把主线程和子线程的未处理异常写入日志，可在实例创建后显式安装 hook：
+
+```python
+logger = YydsLogger("app")
+logger.setup_exception_handler()
+```
+
+异常 hook、标准库 logging 接管和信号处理器均属于进程全局资源；同一时间只能由一个
+`YydsLogger` 实例接管，`cleanup()` 会恢复本实例仍拥有的原处理器。
+
 ### 按 sink 设置独立级别
 
-控制台、主文件、错误文件可分别设级别（例如控制台只看 WARNING，文件留全量 DEBUG）：
+控制台、主文件可分别设级别（例如控制台只看 WARNING，文件留全量 DEBUG）；错误日志始终写入
+`{file_name}_error.log`，并固定记录 ERROR 及以上级别：
+
+默认不设置 `console_level` 和 `file_level` 时，主文件与控制台不进行级别过滤。
 
 ```python
 logger = YydsLogger(
     file_name="app",
-    filter_level="DEBUG",   # 默认级别
     console_level="WARNING",
     file_level="DEBUG",
-    error_level="ERROR",
 )
 ```
 
@@ -220,16 +231,8 @@ logger = YydsLogger(
 容器 / k8s 用 SIGTERM 停服时 `atexit` 不一定触发，开启后会在退出前排空 enqueue 队列，避免丢日志：
 
 ```python
-logger = YydsLogger("app", install_signal_handlers=True)  # 拦截并链回原 SIGTERM/SIGINT 处理器
-```
-
-### 环境变量配置（read_env）
-
-适合多环境部署，无需改代码即可覆盖配置：
-
-```python
-# 环境变量：YYDS_LOG_DIR / YYDS_LOG_LEVEL / YYDS_LOG_LANG / YYDS_LOG_SERIALIZE / YYDS_LOG_ENV
-logger = YydsLogger("app", read_env=True)
+logger = YydsLogger("app")
+logger.setup_signal_handlers()  # 拦截并链回原 SIGTERM/SIGINT 处理器
 ```
 
 ### 异步函数支持
@@ -265,6 +268,15 @@ except ZeroDivisionError:
     # 输出示例：
     # 2025-01-03 10:30:15.123 | ERROR    | ReqID:REQ-123 | app.py:25:divide_numbers | 12345 | 除零错误 [ZeroDivisionError]: division by zero | 位置: app.py:25:divide_numbers | 代码: return a / b
     # 调用链: app.py:25:divide_numbers -> main.py:10:main
+```
+
+`log_decorator()` 的 `trace` 控制详细异常栈；`reraise` 控制异常是否继续抛出，默认值为
+`True`，不会因关闭详细堆栈而吞掉业务异常：
+
+```python
+@logger.log_decorator(trace=False, reraise=True)
+def still_raise():
+    raise ValueError("业务异常仍交给调用方处理")
 ```
 
 ### 耗时统计与行分析 (@time_it)
@@ -326,6 +338,9 @@ checker = LogHealthChecker()
 health = checker.check_health("logs")
 print(health["status"])
 print(health["metrics"]["disk_usage_percent"])
+
+# 如需同时查看 logger 生命周期、handler 数量和队列丢弃数：
+print(logger.get_health())
 ```
 
 ### 日志统计功能
@@ -351,36 +366,42 @@ print(stats)
 logger = YydsLogger(
     file_name="app",                    # 日志文件名
     log_dir="logs",                     # 日志目录
-    max_size=14,                        # 单个日志文件最大大小（MB）
+    max_size=10,                        # 单个日志文件最大大小（MB）
     retention="7 days",                 # 日志保留时间
-    work_type=False,                    # 已废弃，建议用 env；False=测试，True=旧生产
     language="zh",                      # 日志语言（zh/en）
-    rotation_time="1 day",              # 日志轮转时间
     custom_format=None,                 # 自定义日志格式
-    filter_level="DEBUG",               # 默认日志过滤级别
     compression="gz",                   # 日志压缩格式，默认 gzip
     enable_stats=False,                 # 是否启用统计
-    enable_exception_hook=False,        # 是否接管 sys.excepthook（同时兜底子线程异常）
     # —— 新增参数 ——
-    env="prod",                        # "dev"/"prod"，优先于 work_type
-    enqueue=None,                       # 显式覆盖 enqueue（异步非阻塞写入）
+    env="prod",                        # "dev"/"prod"
+    enqueue=None,                       # 显式覆盖 enqueue（异步文件写入）
     diagnose=None,                      # 显式覆盖 diagnose
     backtrace=None,                     # 显式覆盖 backtrace
     serialize=False,                    # 文件输出 JSON 结构化日志
     console_serialize=False,            # 控制台输出 JSON 结构化日志
-    console_level=None,                 # 控制台独立级别（默认随 filter_level）
-    file_level=None,                    # 主文件独立级别（默认随 filter_level）
-    error_level="ERROR",                # 错误文件级别
-    capture_std_logging=False,          # 接管标准库 logging
-    install_signal_handlers=False,      # 注册 SIGTERM/SIGINT 优雅退出
-    read_env=False,                     # 从环境变量读取配置覆盖
-    error_file=False,                   # 是否单独输出错误日志文件
+    console_level=None,                 # 控制台独立级别（默认不过滤）
+    file_level=None,                    # 主文件独立级别（默认不过滤）
     queue_size=10000,                   # 本地 enqueue 队列容量，None 表示无界
     overflow_policy="block",           # 队列满时 block 或 drop
     queue_timeout=None,                 # block 模式最大等待时间
     process_isolation=False,             # 多进程部署时必须改为 True
 )
 ```
+
+### 保留与压缩
+
+`retention` 只清理当前 sink 的轮转归档，不会删除正在写入的活动文件，也不会扫描另一类
+sink 的文件：
+
+```python
+# 默认：轮转归档为 .log.gz，保留策略作用于这些压缩归档
+YydsLogger("app", retention="7 days", compression="gz")
+
+# 不压缩：轮转归档保持为普通 .log，保留策略作用于这些普通归档
+YydsLogger("app", retention="7 days", compression=None)
+```
+
+保留清理由下一次日志轮转触发；如果一直没有新的轮转，过期归档会保留到下一次轮转时再清理。
 
 ### 自定义日志格式
 
@@ -410,7 +431,7 @@ logger = YydsLogger(
 - 自动日志轮转
 - gzip 日志压缩
 - 日志保留策略
-- 可选错误日志文件
+- 固定 ERROR 及以上级别的独立错误日志文件
 - 本地 enqueue 队列与溢出策略
 
 ### 3. 统计功能
@@ -453,10 +474,10 @@ except RuntimeError as e:
 ## 注意事项
 
 1. 确保日志目录具有写入权限
-2. 生产环境建议使用 `env="prod"` + `serialize=True`，并按需 `install_signal_handlers=True`
+2. 生产环境建议使用 `env="prod"` + `serialize=True`，并按需调用 `setup_signal_handlers()`
 3. 异步操作时注意正确处理异常
 4. `serialize=True` 时日志为 JSON，自定义彩色 `format` 的颜色不再生效
-5. 全局 logger 为 loguru 单例，建议单进程内仅实例化一个 YydsLogger，避免多实例 handler 互相叠加
+5. `YydsLogger` 实例的日志 sink 相互隔离；但标准库 logging、异常 hook 和信号处理器属于进程全局资源，同一时间只能由一个实例接管
 
 ## 贡献
 

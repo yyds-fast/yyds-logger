@@ -5,7 +5,12 @@ from functools import wraps
 from time import perf_counter
 
 
-def log_decorator(logger, msg=None, level="ERROR", trace=True):
+def log_decorator(logger, msg=None, level="ERROR", trace=True, reraise=True):
+    """Log function calls and exceptions.
+
+    ``trace`` controls detailed exception logging while ``reraise`` controls
+    whether a caught exception propagates.
+    """
     def decorator(func):
         msg_key = msg or "UNHANDLED_EXCEPTION"
         log_level = level.upper()
@@ -20,7 +25,7 @@ def log_decorator(logger, msg=None, level="ERROR", trace=True):
                     return result
                 except Exception as exc:
                     logger._log_exception(func.__name__, exc, msg_key, log_level, trace, is_async=True)
-                    if trace:
+                    if reraise:
                         raise
                     return None
             return async_wrapper
@@ -35,7 +40,7 @@ def log_decorator(logger, msg=None, level="ERROR", trace=True):
                 return result
             except Exception as exc:
                 logger._log_exception(func.__name__, exc, msg_key, log_level, trace, is_async=False)
-                if trace:
+                if reraise:
                     raise
                 return None
         return sync_wrapper
