@@ -3,6 +3,7 @@
 import inspect
 import logging
 import sys
+import weakref
 from typing import List, Optional
 
 from .i18n import get_message
@@ -22,10 +23,14 @@ def capture_std_logging(logger, level: str = "DEBUG",
         if not isinstance(names, (list, tuple)) or not all(isinstance(name, str) for name in names):
             raise TypeError(get_message(logger.language, "ERR_STD_NAMES"))
     log_module = logging
-    bound_logger = logger.logger
+    logger_ref = weakref.ref(logger)
 
     class _InterceptHandler(log_module.Handler):
         def emit(self, record: "logging.LogRecord") -> None:
+            owner = logger_ref()
+            if owner is None:
+                return
+            bound_logger = owner.logger
             try:
                 level_name = bound_logger.level(record.levelname).name
             except (ValueError, AttributeError):

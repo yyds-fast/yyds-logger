@@ -2,6 +2,7 @@ import functools
 import json
 import multiprocessing
 import os
+import queue
 import threading
 from contextlib import contextmanager
 from threading import Thread
@@ -44,6 +45,7 @@ class Handler:
         queue_size,
         overflow_policy,
         queue_timeout,
+        queue_backend,
         multiprocessing_context,
         error_interceptor,
         exception_formatter,
@@ -62,10 +64,15 @@ class Handler:
         self._queue_size = None if queue_size is None else max(1, int(queue_size))
         self._overflow_policy = str(overflow_policy).lower()
         self._queue_timeout = queue_timeout
+        self._queue_backend = str(queue_backend).lower()
         if self._overflow_policy not in {"block", "drop"}:
             raise ValueError("overflow_policy must be 'block' or 'drop'")
         if self._queue_timeout is not None and float(self._queue_timeout) < 0:
             raise ValueError("queue_timeout must be >= 0")
+        if self._queue_backend not in {"multiprocessing", "thread"}:
+            raise ValueError("queue_backend must be 'multiprocessing' or 'thread'")
+        if self._queue_backend == "thread" and multiprocessing_context is not None:
+            raise ValueError("queue_backend='thread' cannot use a multiprocessing context")
         self._dropped_messages = 0
         self._multiprocessing_context = multiprocessing_context
         self._error_interceptor = error_interceptor
@@ -100,7 +107,11 @@ class Handler:
                 self._decolorized_format = self._formatter.strip()
 
         if self._enqueue:
-            if self._multiprocessing_context is None:
+            if self._queue_backend == "thread":
+                self._queue = queue.Queue(maxsize=self._queue_size or 0)
+                self._confirmation_event = threading.Event()
+                self._confirmation_lock = threading.Lock()
+            elif self._multiprocessing_context is None:
                 self._queue = multiprocessing.Queue(maxsize=self._queue_size or 0)
                 self._confirmation_event = multiprocessing.Event()
                 self._confirmation_lock = multiprocessing.Lock()

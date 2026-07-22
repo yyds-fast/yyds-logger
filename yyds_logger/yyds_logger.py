@@ -45,12 +45,14 @@ class YydsLogger:
 
     _global_resource_lock = threading.RLock()
     _global_resource_owners = {}
-    _ERROR_LEVEL = "ERROR"
+    _process_isolated_instances = weakref.WeakSet()
+    _process_isolated_registry_lock = threading.Lock()
+    _process_isolated_at_fork_registered = False
     _CONFIG_FIELDS = (
         "log_dir", "max_size", "retention", "custom_format", "language",
         "compression", "serialize", "console_serialize",
         "console_level", "file_level", "queue_size",
-        "overflow_policy", "queue_timeout", "process_isolation", "_process_file_name",
+        "overflow_policy", "queue_timeout", "queue_backend", "process_isolation", "_process_file_name",
         "enqueue", "diagnose", "backtrace",
     )
 
@@ -77,6 +79,7 @@ class YydsLogger:
         overflow_policy: str = "block",       # block 或 drop
         queue_timeout: Optional[float] = None, # block 策略的最大等待时间
         process_isolation: bool = False,       # 多进程时将文件名隔离到 PID
+        queue_backend: str = "auto",          # auto / multiprocessing / thread
     ) -> None:
         """
         初始化日志记录器。
@@ -93,6 +96,8 @@ class YydsLogger:
             serialize (bool): 文件输出 JSON 结构化日志（便于 ELK/Loki/Datadog 采集）。
             console_serialize (bool): 控制台输出 JSON 结构化日志。
             console_level/file_level (str): 控制台和主文件的独立级别。
+            queue_backend (str): enqueue 队列实现。"auto" 会在 process_isolation=True
+                时使用本地线程队列，其余场景使用 multiprocessing 队列。
         """
         if not isinstance(file_name, str) or not file_name.strip():
             raise ValueError(get_message(language, "ERR_FILE_NAME"))
@@ -126,6 +131,13 @@ class YydsLogger:
         ):
             raise ValueError(get_message(language, "ERR_QUEUE_TIMEOUT"))
         self.process_isolation = bool(process_isolation)
+        requested_queue_backend = str(queue_backend).strip().lower()
+        if requested_queue_backend == "auto":
+            self.queue_backend = "thread" if self.process_isolation else "multiprocessing"
+        elif requested_queue_backend in {"multiprocessing", "thread"}:
+            self.queue_backend = requested_queue_backend
+        else:
+            raise ValueError(get_message(language, "ERR_QUEUE_BACKEND"))
         self._process_file_name = (
             f"{file_name}.pid{os.getpid()}"
             if self.process_isolation else file_name
@@ -133,7 +145,6 @@ class YydsLogger:
         self.compression = compression
         # 级别号缓存与统计相关阈值
         self._level_no_cache: Dict[str, int] = {}
-        self._error_level_no = 10 ** 9   # 由 configure_logger 精确计算
         self.enable_stats = enable_stats
         self._stats_ready = False
         self._handler_ids: List[int] = []
@@ -195,8 +206,82 @@ class YydsLogger:
         self._stats_ready = True
         # 注册 atexit 钩子，确保程序退出时自动清理 enqueue 队列和信号灯
         atexit.register(self.cleanup)
+        self._register_process_isolated_instance()
 
         self._instance_counted = False
+
+    def _register_process_isolated_instance(self) -> None:
+        """Register one lightweight child-fork hook for PID-isolated loggers.
+
+        ``process_isolation`` used to only calculate the PID once in
+        ``__init__``.  A pre-fork server therefore made every worker inherit
+        the master's filename and queue handlers.  Keep weak references so
+        the process-wide hook does not prolong a logger's lifetime.
+        """
+        if not self.process_isolation or not hasattr(os, "register_at_fork"):
+            return
+
+        cls = type(self)
+        with cls._process_isolated_registry_lock:
+            cls._process_isolated_instances.add(self)
+            if not cls._process_isolated_at_fork_registered:
+                os.register_at_fork(after_in_child=cls._reset_process_isolated_loggers_after_fork)
+                cls._process_isolated_at_fork_registered = True
+
+    @classmethod
+    def _reset_process_isolated_loggers_after_fork(cls) -> None:
+        """Recreate PID-isolated engines in a forked child process.
+
+        This callback deliberately avoids inherited instance locks: a parent
+        thread may have held one at fork time.  The embedded engine is rebuilt
+        instead of attempting to stop queues whose writer threads only exist
+        in the parent process.
+        """
+        cls._global_resource_lock = threading.RLock()
+        for instance in list(cls._process_isolated_instances):
+            instance._reset_after_fork()
+
+    def _reset_after_fork(self) -> None:
+        """Replace parent-owned sinks with fresh child-local PID sinks."""
+        if getattr(self, "_cleanup_state", "open") != "open":
+            return
+
+        self._config_lock = threading.RLock()
+        self._stats_lock = threading.Lock()
+        self._stats_ready = False
+        self._stats = {
+            "total": 0,
+            "error": 0,
+            "warning": 0,
+            "info": 0,
+            "debug": 0,
+        }
+        self._stats_start_time = datetime.now()
+        self.request_id_var = ContextVar("request_id", default="-")
+        self._process_file_name = f"{self.file_name}.pid{os.getpid()}"
+        self._handler_ids = []
+        self._dropped_messages_total = 0
+        self._removed_default_handler = False
+        self._level_no_cache = {}
+
+        # Do not remove inherited handlers: their queue writers belong to the
+        # parent process.  Replacing the whole Core is safe in the child and
+        # leaves no parent-owned queue or file descriptor in use.
+        self._raw_logger = create_logger(stderr=False, register_atexit=False)
+        self.logger = self._raw_logger.patch(self._patch_record)
+        self._logger_d1 = self.logger.opt(depth=1)
+        self._info_level_no = self._safe_level_no("INFO")
+        self._refresh_sink_level_nos()
+
+        try:
+            self._configure_logger()
+        except Exception:
+            # ``_configure_logger()`` already installs its stderr fallback
+            # when a runtime resource (for example the log directory) fails.
+            self._cleanup_state = "failed"
+            return
+
+        self._stats_ready = True
 
     def _patch_record(self, record: Dict[str, Any]) -> None:
         """Inject request context and collect stats for every logger entry point."""
@@ -263,11 +348,9 @@ class YydsLogger:
         self._file_level_no = (
             0 if self.file_level is None else self._safe_level_no(self.file_level)
         )
-        self._error_level_no = self._safe_level_no(self._ERROR_LEVEL)
         self._min_level_no = min(
             self._console_level_no,
             self._file_level_no,
-            self._error_level_no,
         )
 
     def _emits(self, level_upper: str) -> bool:
@@ -278,7 +361,6 @@ class YydsLogger:
             for sink_level in (
                 self._console_level_no,
                 self._file_level_no,
-                self._error_level_no,
             )
         )
 
@@ -404,7 +486,7 @@ class YydsLogger:
             # 新 handler 先独立构建，旧 handler 在全部成功后再移除。
             self._handler_ids = []
             self._add_console_handler(log_format)
-            self._add_file_handlers(log_format)
+            self._add_file_handler(log_format)
             new_handler_ids = list(self._handler_ids)
 
             if old_handler_ids:
@@ -447,6 +529,9 @@ class YydsLogger:
         
         if self.compression is not None and self.compression not in ('zip', 'gz', 'tar'):
             raise ValueError(self._msg('ERR_COMPRESSION'))
+
+        if self.queue_backend not in {"multiprocessing", "thread"}:
+            raise ValueError(self._msg("ERR_QUEUE_BACKEND"))
 
         # 校验级别名是否被 loguru 识别（自定义级别在此之前 add 的也会通过）
         for lvl_name, lvl_value in (
@@ -545,12 +630,12 @@ class YydsLogger:
             queue_size=self.queue_size,
             overflow_policy=self.overflow_policy,
             queue_timeout=self.queue_timeout,
+            queue_backend=self.queue_backend,
         )
         self._handler_ids.append(handler_id)
     
-    def _add_file_handlers(self, log_format: str) -> None:
-        """添加文件处理器"""
-        # 主日志文件
+    def _add_file_handler(self, log_format: str) -> None:
+        """添加主日志文件处理器。"""
         kwargs = self._dynamic_level_kwargs(self.file_level)
         main_log_path = os.path.join(self.log_dir, f"{self._process_file_name}.log")
         handler_id = self.logger.add(
@@ -568,26 +653,7 @@ class YydsLogger:
             queue_size=self.queue_size,
             overflow_policy=self.overflow_policy,
             queue_timeout=self.queue_timeout,
-        )
-        self._handler_ids.append(handler_id)
-        
-        # 错误日志文件始终启用，仅记录 ERROR 及以上级别。
-        error_log_path = self._get_level_log_path("error")
-        handler_id = self.logger.add(
-            error_log_path,
-            format=log_format,
-            level=self._ERROR_LEVEL,
-            rotation=f"{self.max_size} MB",
-            retention=self._archive_retention(error_log_path),
-            compression=self.compression,
-            encoding='utf-8',
-            enqueue=self.enqueue,
-            diagnose=self.diagnose,
-            backtrace=self.backtrace,
-            serialize=self.serialize,
-            queue_size=self.queue_size,
-            overflow_policy=self.overflow_policy,
-            queue_timeout=self.queue_timeout,
+            queue_backend=self.queue_backend,
         )
         self._handler_ids.append(handler_id)
     
@@ -613,12 +679,6 @@ class YydsLogger:
         from .lifecycle import restore_exception_handler
         return restore_exception_handler(self)
 
-    def _get_level_log_path(self, level_name):
-        """
-        获取不同级别日志文件的路径。
-        """
-        return os.path.join(self.log_dir, f"{self._process_file_name}_{level_name}.log")
-
     def get_queue_dropped(self) -> int:
         """返回本实例本地 enqueue sink 因队列满而丢弃的日志数量。"""
         current = sum(
@@ -635,6 +695,7 @@ class YydsLogger:
             "size": self.queue_size,
             "overflow_policy": self.overflow_policy,
             "timeout": self.queue_timeout,
+            "backend": self.queue_backend,
             "dropped_messages": self.get_queue_dropped(),
         }
 
@@ -646,6 +707,7 @@ class YydsLogger:
         result["logger"] = {
             "state": self._cleanup_state,
             "enqueue": bool(self.enqueue),
+            "queue_backend": self.queue_backend,
             "queue_dropped": self.get_queue_dropped(),
             "handler_count": len(self._handler_ids),
         }

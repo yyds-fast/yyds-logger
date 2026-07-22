@@ -138,11 +138,16 @@ logger = YydsLogger(
 
 ### 多进程配置
 
-多进程部署必须使用 `process_isolation=True`，让不同进程写入独立的 PID 日志文件，避免轮转和写入竞争；默认值为 `False`。
+多进程部署必须使用 `process_isolation=True`，让不同进程写入独立的 PID 日志文件，避免轮转和写入竞争；默认值为 `False`。对于 Gunicorn、uWSGI 等 pre-fork 模式，即使 logger 在 master 中创建，worker 也会在 fork 后自动重建自己的 sink 并使用 worker PID 文件名。使用 `spawn` 模式时请在子进程内创建 logger，不要将实例作为进程参数传递。
 
-本地文件 sink 的 enqueue 队列可通过 `queue_size`、`overflow_policy` 和 `queue_timeout` 配置；
+本地文件 sink 的 enqueue 队列可通过 `queue_size`、`overflow_policy`、`queue_timeout` 和
+`queue_backend` 配置；
 队列满时可选择阻塞或丢弃。默认 `block + queue_timeout=None` 会在队列满时等待，因此异步写入
 不等同于永不阻塞。可通过 `get_queue_dropped()` 或 `get_queue_status()` 查看丢弃数量和当前策略。
+
+`queue_backend="auto"` 为默认值：启用 `process_isolation=True` 时使用进程内线程队列，避免不必要的
+pickle/IPC 开销；其他场景保持 `multiprocessing` 队列语义。可显式设为 `"thread"` 或
+`"multiprocessing"` 覆盖该策略。
 
 如需精细控制，可用 `enqueue` / `diagnose` / `backtrace` 三个可选参数显式覆盖：
 
@@ -213,8 +218,7 @@ logger.setup_exception_handler()
 
 ### 按 sink 设置独立级别
 
-控制台、主文件可分别设级别（例如控制台只看 WARNING，文件留全量 DEBUG）；错误日志始终写入
-`{file_name}_error.log`，并固定记录 ERROR 及以上级别：
+控制台、主文件可分别设级别（例如控制台只看 WARNING，文件留全量 DEBUG）：
 
 默认不设置 `console_level` 和 `file_level` 时，主文件与控制台不进行级别过滤。
 
@@ -431,7 +435,6 @@ logger = YydsLogger(
 - 自动日志轮转
 - gzip 日志压缩
 - 日志保留策略
-- 固定 ERROR 及以上级别的独立错误日志文件
 - 本地 enqueue 队列与溢出策略
 
 ### 3. 统计功能
@@ -462,6 +465,18 @@ logger = YydsLogger(
 - 可选异常钩子和 SIGTERM/SIGINT 生命周期处理
 - 可选健康检查：磁盘、内存和日志文件状态
 
+## 性能基准
+
+仓库提供零额外依赖的基准工具，用于比较同步写入、异步阻塞队列和有界丢弃队列的生产端吞吐、
+P50/P95/P99 延迟、排空时间与丢弃量：
+
+```bash
+python benchmarks/bench_logging.py --mode all --messages 20000 --threads 4
+python benchmarks/bench_logging.py --mode enqueue --serialize --json
+```
+
+基准会使用临时日志目录，不会污染项目目录；结果受磁盘、CPU、Python 版本与并发负载影响，应在目标部署环境中比较。
+
 ## 错误处理
 
 ```python
@@ -486,3 +501,5 @@ except RuntimeError as e:
 ## 许可证
 
 MIT License
+
+本发行版内置了经修改的 Loguru 引擎；完整归属与许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

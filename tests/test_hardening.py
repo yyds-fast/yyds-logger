@@ -31,14 +31,14 @@ def test_flush_keeps_logger_open_and_close_releases(tmp_path):
     assert "after-flush" in content
 
 
-def test_error_file_is_always_created(tmp_path):
-    logger = YydsLogger("default-error-file", log_dir=str(tmp_path), enqueue=False)
+def test_error_records_are_written_only_to_main_file(tmp_path):
+    logger = YydsLogger("error-main-file", log_dir=str(tmp_path), enqueue=False)
     try:
         logger.error("error")
     finally:
         logger.cleanup()
-    assert (tmp_path / "default-error-file.log").exists()
-    assert (tmp_path / "default-error-file_error.log").exists()
+    assert "error" in (tmp_path / "error-main-file.log").read_text(encoding="utf-8")
+    assert not (tmp_path / "error-main-file_error.log").exists()
 
 
 def test_dev_environment_enables_diagnostics_by_default(tmp_path):
@@ -65,6 +65,8 @@ def test_invalid_queue_configuration_fails_fast(tmp_path):
         YydsLogger("float-queue", log_dir=str(tmp_path), queue_size=1.5)
     with pytest.raises(ValueError):
         YydsLogger("bad-timeout", log_dir=str(tmp_path), queue_timeout="never")
+    with pytest.raises(ValueError):
+        YydsLogger("bad-queue-backend", log_dir=str(tmp_path), queue_backend="invalid")
 
 
 def test_async_flush_is_available_inside_event_loop(tmp_path):
@@ -151,7 +153,7 @@ def test_default_sinks_do_not_filter_trace_level(tmp_path):
     assert "trace-marker" in (tmp_path / "unfiltered.log").read_text(encoding="utf-8")
 
 
-def test_size_rotation_applies_to_main_and_error_files(tmp_path, monkeypatch):
+def test_size_rotation_applies_to_main_file(tmp_path, monkeypatch):
     logger = YydsLogger("size-rotation", log_dir=str(tmp_path), enqueue=False)
     original_add = logger.logger.add
     seen_rotations = []
@@ -165,7 +167,7 @@ def test_size_rotation_applies_to_main_and_error_files(tmp_path, monkeypatch):
         monkeypatch.setattr(logger.logger, "add", record_add)
         logger.max_size = 20
         logger.configure_logger()
-        assert seen_rotations == ["20 MB", "20 MB"]
+        assert seen_rotations == ["20 MB"]
     finally:
         logger.cleanup()
 
@@ -187,20 +189,20 @@ def test_retention_targets_only_matching_archives(
     active = tmp_path / "retention.log"
     matching_archive = tmp_path / ("retention.2000-01-01_00-00-00" + retained_suffix)
     other_archive_type = tmp_path / ("retention.2000-01-01_00-00-01" + other_suffix)
-    error_archive = tmp_path / ("retention_error.2000-01-01_00-00-00" + retained_suffix)
+    other_sink_archive = tmp_path / ("retention_other.2000-01-01_00-00-00" + retained_suffix)
     try:
-        for path in (matching_archive, other_archive_type, error_archive):
+        for path in (matching_archive, other_archive_type, other_sink_archive):
             path.write_text("archive", encoding="utf-8")
             os.utime(path, (time.time() - 10, time.time() - 10))
 
         logger._archive_retention(str(active))(
-            [str(active), str(matching_archive), str(other_archive_type), str(error_archive)]
+            [str(active), str(matching_archive), str(other_archive_type), str(other_sink_archive)]
         )
 
         assert active.exists()
         assert not matching_archive.exists()
         assert other_archive_type.exists()
-        assert error_archive.exists()
+        assert other_sink_archive.exists()
     finally:
         logger.cleanup()
 
@@ -360,14 +362,35 @@ def test_queue_status_and_health_include_logger_state(tmp_path):
             "size": 12,
             "overflow_policy": "drop",
             "timeout": None,
+            "backend": "multiprocessing",
             "dropped_messages": 0,
         }
         health = logger.get_health()
         assert health["logger"]["state"] == "open"
         assert health["logger"]["enqueue"] is False
-        assert health["logger"]["handler_count"] == 3
+        assert health["logger"]["queue_backend"] == "multiprocessing"
+        assert health["logger"]["handler_count"] == 2
     finally:
         logger.cleanup()
+
+
+def test_process_isolation_uses_thread_queue_backend_by_default(tmp_path):
+    normal = YydsLogger("normal-queue", log_dir=str(tmp_path), enqueue=False)
+    isolated = YydsLogger(
+        "isolated-queue", log_dir=str(tmp_path), process_isolation=True, enqueue=True,
+    )
+    forced = YydsLogger(
+        "forced-queue", log_dir=str(tmp_path), process_isolation=True,
+        queue_backend="multiprocessing", enqueue=False,
+    )
+    try:
+        assert normal.get_queue_status()["backend"] == "multiprocessing"
+        assert isolated.get_queue_status()["backend"] == "thread"
+        assert forced.get_queue_status()["backend"] == "multiprocessing"
+    finally:
+        forced.cleanup()
+        isolated.cleanup()
+        normal.cleanup()
 
 
 def test_pid_file_isolation(tmp_path):
@@ -382,6 +405,89 @@ def test_pid_file_isolation(tmp_path):
     finally:
         logger.cleanup()
     assert (tmp_path / f"service.pid{__import__('os').getpid()}.log").exists()
+
+
+@pytest.mark.skipif(
+    "fork" not in __import__("multiprocessing").get_all_start_methods(),
+    reason="PID reinitialization is specific to fork-capable platforms",
+)
+@pytest.mark.parametrize("enqueue", [False, True])
+def test_pid_file_isolation_rebuilds_sinks_after_prefork(tmp_path, enqueue):
+    """A logger created by a pre-fork master must not keep its master's PID."""
+    import multiprocessing
+
+    logger = YydsLogger(
+        "prefork-service",
+        log_dir=str(tmp_path),
+        process_isolation=True,
+        enqueue=enqueue,
+        console_level="CRITICAL",
+    )
+    parent_pid = os.getpid()
+
+    def child_main():
+        logger.info("child-only")
+        logger.cleanup()
+
+    try:
+        logger.info("parent-only")
+        process = multiprocessing.get_context("fork").Process(target=child_main)
+        process.start()
+        child_pid = process.pid
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    finally:
+        logger.cleanup()
+
+    parent_file = tmp_path / f"prefork-service.pid{parent_pid}.log"
+    child_file = tmp_path / f"prefork-service.pid{child_pid}.log"
+    assert "parent-only" in parent_file.read_text(encoding="utf-8")
+    assert "child-only" not in parent_file.read_text(encoding="utf-8")
+    assert "child-only" in child_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    "fork" not in __import__("multiprocessing").get_all_start_methods(),
+    reason="PID reinitialization is specific to fork-capable platforms",
+)
+def test_stdlib_capture_uses_rebuilt_engine_after_prefork(tmp_path):
+    import multiprocessing
+
+    name = "prefork-stdlib-bridge"
+    target = logging.getLogger(name)
+    original_handlers = list(target.handlers)
+    original_level = target.level
+    original_propagate = target.propagate
+    logger = YydsLogger(
+        "prefork-bridge",
+        log_dir=str(tmp_path),
+        process_isolation=True,
+        enqueue=False,
+        console_level="CRITICAL",
+    )
+    parent_pid = os.getpid()
+
+    def child_main():
+        logging.getLogger(name).warning("child-stdlib-only")
+        logger.cleanup()
+
+    try:
+        logger.capture_std_logging(names=[name], level="WARNING")
+        process = multiprocessing.get_context("fork").Process(target=child_main)
+        process.start()
+        child_pid = process.pid
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    finally:
+        logger.cleanup()
+        target.handlers = original_handlers
+        target.setLevel(original_level)
+        target.propagate = original_propagate
+
+    parent_file = tmp_path / f"prefork-bridge.pid{parent_pid}.log"
+    assert "child-stdlib-only" not in parent_file.read_text(encoding="utf-8")
+    child_file = tmp_path / f"prefork-bridge.pid{child_pid}.log"
+    assert "child-stdlib-only" in child_file.read_text(encoding="utf-8")
 
 
 def test_basic_stats_are_returned(tmp_path):
