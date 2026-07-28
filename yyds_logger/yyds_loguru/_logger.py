@@ -257,6 +257,7 @@ class Logger:
         overflow_policy="block",
         queue_timeout=None,
         queue_backend="multiprocessing",
+        shutdown_timeout=30.0,
         context=_defaults.LOGURU_CONTEXT,
         catch=_defaults.LOGURU_CATCH,
         **kwargs
@@ -1011,6 +1012,7 @@ class Logger:
                 overflow_policy=overflow_policy,
                 queue_timeout=queue_timeout,
                 queue_backend=queue_backend,
+                shutdown_timeout=shutdown_timeout,
                 multiprocessing_context=context,
                 id_=handler_id,
                 error_interceptor=error_interceptor,

@@ -12,15 +12,17 @@
 - **接管标准库 logging**：把 uvicorn / sqlalchemy 等三方库日志统一汇入本管道（通过 `sys._getframe` C 级原生帧跳过深度优化性能）
 - **环境感知（env='prod'/'dev'）**：默认为 `'prod'` (生产环境优先)，生产自动关闭 diagnose/backtrace，使用异步文件写入
 - **有界本地队列**：支持 `queue_size`、`block/drop` 溢出策略和 `queue_timeout`
-- **按 sink 独立级别**：控制台、主文件可各自设级别；错误文件固定记录 ERROR 及以上
+- **按 sink 独立级别**：控制台、主文件可各自设置级别
 - request_id 上下文注入（ContextVar）+ `bind/contextualize` 结构化字段与 trace 关联
 - 装饰器记录函数调用与耗时（同步/异步），级别关闭时自动跳过昂贵格式化
 - 轻量基础统计（总量、级别计数、错误率）
 - 可选健康检查（磁盘、内存、日志文件数量和大小）
 - **纯零核心依赖**：移除了对外部 `loguru` 包的硬性安装依赖，基础版零额外依赖，轻量可靠且彻底杜绝依赖版本冲突风险
-- **优雅资源管理**：支持 `flush()`、`flush_async()`、`close()`、`cleanup()` 和可选 SIGTERM 处理
+- **优雅资源管理**：支持 `flush()`、`flush_async()`、`close()`、`aclose()`、同步/异步上下文管理和可选 SIGTERM 处理
 
 ## 安装
+
+需要 Python 3.9 或更高版本。
 
 ```bash
 pip install -U yyds-logger
@@ -70,6 +72,11 @@ logger.cleanup()
 
 ```python
 await logger.flush_async()
+await logger.aclose()
+
+# 也可以自动异步关闭
+async with YydsLogger("app") as logger:
+    logger.info("处理中")
 ```
 
 #### request_id 用法与并发说明
@@ -140,14 +147,15 @@ logger = YydsLogger(
 
 多进程部署必须使用 `process_isolation=True`，让不同进程写入独立的 PID 日志文件，避免轮转和写入竞争；默认值为 `False`。对于 Gunicorn、uWSGI 等 pre-fork 模式，即使 logger 在 master 中创建，worker 也会在 fork 后自动重建自己的 sink 并使用 worker PID 文件名。使用 `spawn` 模式时请在子进程内创建 logger，不要将实例作为进程参数传递。
 
-本地文件 sink 的 enqueue 队列可通过 `queue_size`、`overflow_policy`、`queue_timeout` 和
-`queue_backend` 配置；
-队列满时可选择阻塞或丢弃。默认 `block + queue_timeout=None` 会在队列满时等待，因此异步写入
-不等同于永不阻塞。可通过 `get_queue_dropped()` 或 `get_queue_status()` 查看丢弃数量和当前策略。
+本地文件 sink 的 enqueue 队列可通过 `queue_size`、`overflow_policy`、`queue_timeout`、
+`queue_backend` 和 `shutdown_timeout` 配置。队列满时可选择阻塞或丢弃；默认 block 最多等待
+1 秒，flush/close 的每次队列控制或 writer join 默认最多等待 30 秒。将
+`shutdown_timeout` 设为 `None` 可恢复无限等待。
 
-`queue_backend="auto"` 为默认值：启用 `process_isolation=True` 时使用进程内线程队列，避免不必要的
-pickle/IPC 开销；其他场景保持 `multiprocessing` 队列语义。可显式设为 `"thread"` 或
-`"multiprocessing"` 覆盖该策略。
+`queue_backend="auto"` 默认使用进程内线程队列，避免 pickle、IPC、额外 feeder 线程和文件描述符开销。
+多进程部署配合 `process_isolation=True` 时，每个 worker 同样使用自己的线程队列和 PID 文件。
+只有确实依赖 multiprocessing 队列语义时才应显式选择 `"multiprocessing"`；不可 pickle 的结构化字段
+会被拒绝并计入 `dropped_messages` 与 `serialization_errors`，可通过 `get_queue_status()` 查看。
 
 如需精细控制，可用 `enqueue` / `diagnose` / `backtrace` 三个可选参数显式覆盖：
 
@@ -387,8 +395,10 @@ logger = YydsLogger(
     file_level=None,                    # 主文件独立级别（默认不过滤）
     queue_size=10000,                   # 本地 enqueue 队列容量，None 表示无界
     overflow_policy="block",           # 队列满时 block 或 drop
-    queue_timeout=None,                 # block 模式最大等待时间
-    process_isolation=False,             # 多进程部署时必须改为 True
+    queue_timeout=1.0,                  # block 模式最大等待时间；None 表示无限等待
+    queue_backend="auto",              # 默认解析为 thread
+    shutdown_timeout=30.0,              # 队列控制或 writer join 的单次等待上限
+    process_isolation=False,            # 多进程部署时必须改为 True
 )
 ```
 

@@ -185,6 +185,7 @@ class LevelConfig(TypedDict, total=False):
 ActivationConfig = Tuple[Optional[str], bool]
 
 class Logger:
+    _core: Any
     @overload
     def add(
         self,
@@ -198,6 +199,11 @@ class Logger:
         backtrace: bool = ...,
         diagnose: bool = ...,
         enqueue: bool = ...,
+        queue_size: Optional[int] = ...,
+        overflow_policy: str = ...,
+        queue_timeout: Optional[float] = ...,
+        queue_backend: str = ...,
+        shutdown_timeout: Optional[float] = ...,
         context: Optional[Union[str, BaseContext]] = ...,
         catch: bool = ...
     ) -> int: ...
@@ -214,6 +220,11 @@ class Logger:
         backtrace: bool = ...,
         diagnose: bool = ...,
         enqueue: bool = ...,
+        queue_size: Optional[int] = ...,
+        overflow_policy: str = ...,
+        queue_timeout: Optional[float] = ...,
+        queue_backend: str = ...,
+        shutdown_timeout: Optional[float] = ...,
         catch: bool = ...,
         context: Optional[Union[str, BaseContext]] = ...,
         loop: Optional[AbstractEventLoop] = ...
@@ -231,6 +242,11 @@ class Logger:
         backtrace: bool = ...,
         diagnose: bool = ...,
         enqueue: bool = ...,
+        queue_size: Optional[int] = ...,
+        overflow_policy: str = ...,
+        queue_timeout: Optional[float] = ...,
+        queue_backend: str = ...,
+        shutdown_timeout: Optional[float] = ...,
         context: Optional[Union[str, BaseContext]] = ...,
         catch: bool = ...,
         rotation: Optional[Union[str, int, time, timedelta, RotationFunction]] = ...,
@@ -366,3 +382,4 @@ class Logger:
     def stop(self, *args: Any, **kwargs: Any) -> None: ...
 
 logger: Logger
+def create_logger(stderr: bool = ..., register_atexit: bool = ...) -> Logger: ...

@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import contextlib
+import io
 import json
 import os
 import signal
@@ -67,6 +69,8 @@ def test_invalid_queue_configuration_fails_fast(tmp_path):
         YydsLogger("bad-timeout", log_dir=str(tmp_path), queue_timeout="never")
     with pytest.raises(ValueError):
         YydsLogger("bad-queue-backend", log_dir=str(tmp_path), queue_backend="invalid")
+    with pytest.raises(ValueError):
+        YydsLogger("bad-shutdown-timeout", log_dir=str(tmp_path), shutdown_timeout=0)
 
 
 def test_async_flush_is_available_inside_event_loop(tmp_path):
@@ -80,6 +84,141 @@ def test_async_flush_is_available_inside_event_loop(tmp_path):
 
     asyncio.run(scenario())
     assert "async flush marker" in (tmp_path / "async-flush.log").read_text(encoding="utf-8")
+
+
+def test_async_flush_and_close_do_not_block_event_loop(tmp_path):
+    async def scenario():
+        logger = YydsLogger(
+            "async-non-blocking",
+            log_dir=str(tmp_path),
+            queue_backend="thread",
+            console_level="CRITICAL",
+            compression=None,
+        )
+        file_handler = next(
+            handler for handler in logger.logger._core.handlers.values()
+            if handler._enqueue
+        )
+        original_write = file_handler._sink.write
+
+        def slow_write(message):
+            time.sleep(0.003)
+            original_write(message)
+
+        file_handler._sink.write = slow_write
+        for index in range(40):
+            logger.info("async marker {}", index)
+
+        ticks = 0
+        running = True
+
+        async def heartbeat():
+            nonlocal ticks
+            while running:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0)
+        ticks_before_flush = ticks
+        await logger.flush_async()
+        assert ticks > ticks_before_flush
+        await logger.aclose()
+        assert logger._cleanup_state == "closed"
+        running = False
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_async_flush_waits_for_user_async_sink_without_enqueue(tmp_path):
+    received = []
+
+    async def scenario():
+        logger = YydsLogger(
+            "async-user-sink",
+            log_dir=str(tmp_path),
+            enqueue=False,
+            console_level="CRITICAL",
+        )
+
+        async def sink(message):
+            await asyncio.sleep(0.01)
+            received.append(str(message))
+
+        logger.add(sink, format="{message}")
+        logger.info("user async marker")
+        await logger.flush_async()
+        assert any("user async marker" in message for message in received)
+        await logger.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_async_context_manager_flushes_and_closes(tmp_path):
+    async def scenario():
+        logger = YydsLogger(
+            "async-context",
+            log_dir=str(tmp_path),
+            console_level="CRITICAL",
+        )
+        async with logger:
+            logger.info("async context marker")
+        assert logger._cleanup_state == "closed"
+
+    asyncio.run(scenario())
+    assert "async context marker" in (
+        tmp_path / "async-context.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_flush_timeout_is_bounded_and_retryable(tmp_path, monkeypatch):
+    logger = YydsLogger(
+        "flush-timeout",
+        log_dir=str(tmp_path),
+        queue_backend="thread",
+        shutdown_timeout=0.1,
+        console_level="CRITICAL",
+    )
+    handler = next(
+        item for item in logger.logger._core.handlers.values()
+        if item._enqueue
+    )
+    original_wait = handler._confirmation_event.wait
+    monkeypatch.setattr(handler._confirmation_event, "wait", lambda timeout=None: False)
+    try:
+        with pytest.raises(TimeoutError):
+            logger.flush()
+    finally:
+        monkeypatch.setattr(handler._confirmation_event, "wait", original_wait)
+        logger.cleanup()
+
+
+def test_cleanup_drain_timeout_preserves_managed_state_for_retry(tmp_path, monkeypatch):
+    logger = YydsLogger(
+        "cleanup-timeout-retry",
+        log_dir=str(tmp_path),
+        queue_backend="thread",
+        shutdown_timeout=0.1,
+        console_level="CRITICAL",
+    )
+    handler = next(
+        item for item in logger.logger._core.handlers.values()
+        if item._enqueue
+    )
+    managed_ids = list(logger._handler_ids)
+    original_wait = handler._confirmation_event.wait
+    monkeypatch.setattr(handler._confirmation_event, "wait", lambda timeout=None: False)
+
+    with pytest.raises(TimeoutError):
+        logger.cleanup()
+
+    assert logger._cleanup_state == "failed"
+    assert logger._handler_ids == managed_ids
+
+    monkeypatch.setattr(handler._confirmation_event, "wait", original_wait)
+    logger.cleanup()
+    assert logger._cleanup_state == "closed"
 
 
 def test_serialized_file_output_is_valid_json(tmp_path):
@@ -213,11 +352,11 @@ def test_cleanup_can_retry_after_failure(tmp_path, monkeypatch):
     original_remove = logger._remove_handlers
     failed = {"once": False}
 
-    def fail_once(wait=False):
+    def fail_once(wait=False, strict=False):
         if not failed["once"]:
             failed["once"] = True
             raise RuntimeError("synthetic cleanup failure")
-        return original_remove(wait=wait)
+        return original_remove(wait=wait, strict=strict)
 
     monkeypatch.setattr(logger, "_remove_handlers", fail_once)
     with pytest.raises(RuntimeError):
@@ -347,6 +486,47 @@ def test_local_sink_queue_configuration(tmp_path):
         logger.cleanup()
 
 
+def test_multiprocessing_serialization_failure_is_counted(tmp_path):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        logger = YydsLogger(
+            "serialization-failure",
+            log_dir=str(tmp_path),
+            queue_backend="multiprocessing",
+            console_level="CRITICAL",
+            compression=None,
+        )
+        try:
+            logger.bind(lock=threading.Lock()).info("must-not-be-silent")
+            logger.flush()
+            status = logger.get_queue_status()
+            assert status["dropped_messages"] == 1
+            assert status["serialization_errors"] == 1
+        finally:
+            logger.cleanup()
+    assert "cannot pickle" in stderr.getvalue()
+    assert "must-not-be-silent" not in (
+        tmp_path / "serialization-failure.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_cleanup_removes_handlers_added_through_embedded_logger(tmp_path):
+    logger = YydsLogger(
+        "managed-close", log_dir=str(tmp_path), enqueue=False,
+        console_level="CRITICAL",
+    )
+    extra_path = tmp_path / "extra.log"
+    logger.add(str(extra_path), enqueue=False, format="{message}")
+    assert logger.get_health()["logger"]["handler_count"] == 3
+    logger.info("before-close")
+    logger.cleanup()
+
+    assert logger.logger._core.handlers == {}
+    with pytest.raises(RuntimeError):
+        logger.info("after-close")
+    assert "after-close" not in extra_path.read_text(encoding="utf-8")
+
+
 def test_queue_status_and_health_include_logger_state(tmp_path):
     logger = YydsLogger(
         "queue-status",
@@ -361,20 +541,23 @@ def test_queue_status_and_health_include_logger_state(tmp_path):
             "enabled": False,
             "size": 12,
             "overflow_policy": "drop",
-            "timeout": None,
-            "backend": "multiprocessing",
+            "timeout": 1.0,
+            "backend": "thread",
+            "shutdown_timeout": 30.0,
             "dropped_messages": 0,
+            "serialization_errors": 0,
         }
         health = logger.get_health()
         assert health["logger"]["state"] == "open"
         assert health["logger"]["enqueue"] is False
-        assert health["logger"]["queue_backend"] == "multiprocessing"
+        assert health["logger"]["queue_backend"] == "thread"
+        assert health["logger"]["queue_serialization_errors"] == 0
         assert health["logger"]["handler_count"] == 2
     finally:
         logger.cleanup()
 
 
-def test_process_isolation_uses_thread_queue_backend_by_default(tmp_path):
+def test_auto_queue_backend_uses_thread_with_or_without_process_isolation(tmp_path):
     normal = YydsLogger("normal-queue", log_dir=str(tmp_path), enqueue=False)
     isolated = YydsLogger(
         "isolated-queue", log_dir=str(tmp_path), process_isolation=True, enqueue=True,
@@ -384,7 +567,7 @@ def test_process_isolation_uses_thread_queue_backend_by_default(tmp_path):
         queue_backend="multiprocessing", enqueue=False,
     )
     try:
-        assert normal.get_queue_status()["backend"] == "multiprocessing"
+        assert normal.get_queue_status()["backend"] == "thread"
         assert isolated.get_queue_status()["backend"] == "thread"
         assert forced.get_queue_status()["backend"] == "multiprocessing"
     finally:

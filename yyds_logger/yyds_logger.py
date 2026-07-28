@@ -14,7 +14,7 @@ import logging
 import asyncio
 import math
 
-from typing import Optional, Dict, Any, List
+from typing import TYPE_CHECKING, Optional, Dict, Any, List
 
 from contextvars import ContextVar
 from datetime import datetime
@@ -23,6 +23,9 @@ import weakref
 
 from .yyds_loguru import create_logger
 from .i18n import LANG_MAP, get_message
+
+if TYPE_CHECKING:
+    from .yyds_loguru import Record
 
 
 class YydsLogger:
@@ -44,15 +47,16 @@ class YydsLogger:
     """
 
     _global_resource_lock = threading.RLock()
-    _global_resource_owners = {}
-    _process_isolated_instances = weakref.WeakSet()
+    _global_resource_owners: Dict[str, weakref.ReferenceType] = {}
+    _process_isolated_instances: weakref.WeakSet = weakref.WeakSet()
     _process_isolated_registry_lock = threading.Lock()
     _process_isolated_at_fork_registered = False
     _CONFIG_FIELDS = (
         "log_dir", "max_size", "retention", "custom_format", "language",
         "compression", "serialize", "console_serialize",
         "console_level", "file_level", "queue_size",
-        "overflow_policy", "queue_timeout", "queue_backend", "process_isolation", "_process_file_name",
+        "overflow_policy", "queue_timeout", "queue_backend", "shutdown_timeout",
+        "process_isolation", "_process_file_name",
         "enqueue", "diagnose", "backtrace",
     )
 
@@ -77,9 +81,10 @@ class YydsLogger:
         file_level: Optional[str] = None,      # 新增：主文件独立级别
         queue_size: Optional[int] = 10000,     # 本地 enqueue 队列容量；None 表示无界队列
         overflow_policy: str = "block",       # block 或 drop
-        queue_timeout: Optional[float] = None, # block 策略的最大等待时间
+        queue_timeout: Optional[float] = 1.0,  # block 策略的最大等待时间
         process_isolation: bool = False,       # 多进程时将文件名隔离到 PID
         queue_backend: str = "auto",          # auto / multiprocessing / thread
+        shutdown_timeout: Optional[float] = 30.0, # 队列控制/writer join 的单次等待上限
     ) -> None:
         """
         初始化日志记录器。
@@ -96,8 +101,9 @@ class YydsLogger:
             serialize (bool): 文件输出 JSON 结构化日志（便于 ELK/Loki/Datadog 采集）。
             console_serialize (bool): 控制台输出 JSON 结构化日志。
             console_level/file_level (str): 控制台和主文件的独立级别。
-            queue_backend (str): enqueue 队列实现。"auto" 会在 process_isolation=True
-                时使用本地线程队列，其余场景使用 multiprocessing 队列。
+            queue_backend (str): enqueue 队列实现。"auto" 默认使用本地线程队列；
+                只有明确需要跨进程共享队列时才应选择 "multiprocessing"。
+            shutdown_timeout (float, optional): 队列控制或 writer join 的单次最大等待秒数。
         """
         if not isinstance(file_name, str) or not file_name.strip():
             raise ValueError(get_message(language, "ERR_FILE_NAME"))
@@ -130,10 +136,20 @@ class YydsLogger:
             self.queue_timeout < 0 or not math.isfinite(self.queue_timeout)
         ):
             raise ValueError(get_message(language, "ERR_QUEUE_TIMEOUT"))
+        try:
+            self.shutdown_timeout = (
+                None if shutdown_timeout is None else float(shutdown_timeout)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(get_message(language, "ERR_SHUTDOWN_TIMEOUT")) from exc
+        if self.shutdown_timeout is not None and (
+            self.shutdown_timeout <= 0 or not math.isfinite(self.shutdown_timeout)
+        ):
+            raise ValueError(get_message(language, "ERR_SHUTDOWN_TIMEOUT"))
         self.process_isolation = bool(process_isolation)
         requested_queue_backend = str(queue_backend).strip().lower()
         if requested_queue_backend == "auto":
-            self.queue_backend = "thread" if self.process_isolation else "multiprocessing"
+            self.queue_backend = "thread"
         elif requested_queue_backend in {"multiprocessing", "thread"}:
             self.queue_backend = requested_queue_backend
         else:
@@ -148,7 +164,9 @@ class YydsLogger:
         self.enable_stats = enable_stats
         self._stats_ready = False
         self._handler_ids: List[int] = []
+        self._failed_handler_stops: List[Any] = []
         self._dropped_messages_total = 0
+        self._serialization_errors_total = 0
         self._removed_default_handler = False
         self._cleaned_up = False
         self._cleanup_state = "open"
@@ -156,8 +174,8 @@ class YydsLogger:
         self._threading_exception_hook = None
         self._prev_excepthook = None
         self._std_logging_state = None
-        self._prev_signal_handlers = {}
-        self._signal_handlers = {}
+        self._prev_signal_handlers: Dict[Any, Any] = {}
+        self._signal_handlers: Dict[Any, Any] = {}
         self._prev_threading_excepthook = None
 
         # 语言选项
@@ -260,7 +278,9 @@ class YydsLogger:
         self.request_id_var = ContextVar("request_id", default="-")
         self._process_file_name = f"{self.file_name}.pid{os.getpid()}"
         self._handler_ids = []
+        self._failed_handler_stops = []
         self._dropped_messages_total = 0
+        self._serialization_errors_total = 0
         self._removed_default_handler = False
         self._level_no_cache = {}
 
@@ -283,7 +303,7 @@ class YydsLogger:
 
         self._stats_ready = True
 
-    def _patch_record(self, record: Dict[str, Any]) -> None:
+    def _patch_record(self, record: "Record") -> None:
         """Inject request context and collect stats for every logger entry point."""
         record["extra"].setdefault("request_id", self.request_id_var.get() or "-")
         if self._stats_ready and self.enable_stats:
@@ -400,18 +420,13 @@ class YydsLogger:
             err_tpl = messages.get('FORMAT_ERR_GENERIC', " (格式化错误: {error})")
             return f"{text}{err_tpl.format(error=str(e))}"
 
-    def _remove_handlers(self, wait: bool = False) -> None:
+    def _remove_handlers(self, wait: bool = False, strict: bool = False) -> None:
         handler_ids = list(self._handler_ids)
-        self._handler_ids.clear()
         active_handlers = {
             getattr(handler, "_id", None): handler
             for handler in getattr(self.logger._core, "handlers", {}).values()
             if getattr(handler, "_id", None) in handler_ids
         }
-        self._dropped_messages_total += sum(
-            int(getattr(handler, "dropped_messages", 0))
-            for handler in active_handlers.values()
-        )
 
         # 仅当本实例存在 enqueue 文件 handler 时才需要排空与 gc：
         # 控制台始终非 enqueue；enqueue=False 时没有 multiprocessing 队列/信号灯，
@@ -425,23 +440,87 @@ class YydsLogger:
         if need_drain:
             # 在 remove 之前调用 complete()，等待所有 enqueue 队列排空
             try:
-                self._run_complete()
+                asyncio.get_running_loop()
             except RuntimeError:
-                # 已有事件循环运行中，回退等待
-                time.sleep(0.1)
-            except Exception:
-                time.sleep(0.1)
+                self._run_complete()
+            else:
+                # ``remove()`` below still drains via its FIFO stop marker.  A
+                # synchronous close inside an event loop can therefore proceed
+                # without the former unconditional ``time.sleep(0.1)`` delay.
+                pass
 
+        # Keep managed IDs and counters unchanged if draining fails so a later
+        # cleanup can retry this phase without taking a fallback path or
+        # counting the same dropped records twice.
+        self._handler_ids.clear()
+        self._dropped_messages_total += sum(
+            int(getattr(handler, "dropped_messages", 0))
+            for handler in active_handlers.values()
+        )
+        self._serialization_errors_total += sum(
+            int(getattr(handler, "serialization_errors", 0))
+            for handler in active_handlers.values()
+        )
+
+        first_error = None
         for handler_id in handler_ids:
             try:
                 self.logger.remove(handler_id)
-            except Exception:
+            except Exception as exc:
+                handler = active_handlers.get(handler_id)
+                if handler is not None and handler not in self._failed_handler_stops:
+                    self._failed_handler_stops.append(handler)
+                if first_error is None:
+                    first_error = exc
                 continue
 
         if need_drain:
             # 强制垃圾回收，确保 multiprocessing.SimpleQueue 及其底层信号灯被释放
             import gc
             gc.collect()
+        if strict and first_error is not None:
+            raise RuntimeError("Failed to remove one or more logger handlers") from first_error
+
+    def _remove_remaining_handlers(self, strict: bool = False) -> None:
+        """Remove sinks added through the exposed embedded logger as well."""
+        remaining = {
+            getattr(handler, "_id", None): handler
+            for handler in getattr(self.logger._core, "handlers", {}).values()
+        }
+        self._dropped_messages_total += sum(
+            int(getattr(handler, "dropped_messages", 0))
+            for handler in remaining.values()
+        )
+        self._serialization_errors_total += sum(
+            int(getattr(handler, "serialization_errors", 0))
+            for handler in remaining.values()
+        )
+        first_error = None
+        for handler_id in remaining:
+            try:
+                self.logger.remove(handler_id)
+            except Exception as exc:
+                handler = remaining.get(handler_id)
+                if handler is not None and handler not in self._failed_handler_stops:
+                    self._failed_handler_stops.append(handler)
+                if first_error is None:
+                    first_error = exc
+        if strict and first_error is not None:
+            raise RuntimeError("Failed to remove one or more unmanaged logger handlers") from first_error
+
+    def _retry_failed_handler_stops(self, strict: bool = False) -> None:
+        pending = list(self._failed_handler_stops)
+        self._failed_handler_stops.clear()
+        first_error = None
+        for handler in pending:
+            try:
+                handler.stop()
+            except Exception as exc:
+                self._failed_handler_stops.append(handler)
+                if first_error is None:
+                    first_error = exc
+        if strict and first_error is not None:
+            raise RuntimeError("Failed to finish stopping logger handlers") from first_error
 
     def _run_complete(self) -> None:
         """在同步上下文中正确驱动 Loguru 的 awaitable complete。"""
@@ -505,6 +584,7 @@ class YydsLogger:
                 self._handler_ids = new_handler_ids
                 self._remove_handlers(wait=False)
             if has_previous_config:
+                assert old_config is not None
                 self._restore_config(old_config)
                 self._handler_ids = old_handler_ids
                 self._logger_d1 = self.logger.opt(depth=1)
@@ -532,6 +612,29 @@ class YydsLogger:
 
         if self.queue_backend not in {"multiprocessing", "thread"}:
             raise ValueError(self._msg("ERR_QUEUE_BACKEND"))
+
+        if self.queue_size is not None and (
+            isinstance(self.queue_size, bool)
+            or not isinstance(self.queue_size, int)
+            or self.queue_size <= 0
+        ):
+            raise TypeError(self._msg("ERR_QUEUE_SIZE"))
+        if self.overflow_policy not in {"block", "drop"}:
+            raise ValueError(self._msg("ERR_OVERFLOW_POLICY"))
+        if self.queue_timeout is not None and (
+            isinstance(self.queue_timeout, bool)
+            or not isinstance(self.queue_timeout, (int, float))
+            or self.queue_timeout < 0
+            or not math.isfinite(self.queue_timeout)
+        ):
+            raise ValueError(self._msg("ERR_QUEUE_TIMEOUT"))
+        if self.shutdown_timeout is not None and (
+            isinstance(self.shutdown_timeout, bool)
+            or not isinstance(self.shutdown_timeout, (int, float))
+            or self.shutdown_timeout <= 0
+            or not math.isfinite(self.shutdown_timeout)
+        ):
+            raise ValueError(self._msg("ERR_SHUTDOWN_TIMEOUT"))
 
         # 校验级别名是否被 loguru 识别（自定义级别在此之前 add 的也会通过）
         for lvl_name, lvl_value in (
@@ -631,6 +734,7 @@ class YydsLogger:
             overflow_policy=self.overflow_policy,
             queue_timeout=self.queue_timeout,
             queue_backend=self.queue_backend,
+            shutdown_timeout=self.shutdown_timeout,
         )
         self._handler_ids.append(handler_id)
     
@@ -654,6 +758,7 @@ class YydsLogger:
             overflow_policy=self.overflow_policy,
             queue_timeout=self.queue_timeout,
             queue_backend=self.queue_backend,
+            shutdown_timeout=self.shutdown_timeout,
         )
         self._handler_ids.append(handler_id)
     
@@ -680,13 +785,22 @@ class YydsLogger:
         return restore_exception_handler(self)
 
     def get_queue_dropped(self) -> int:
-        """返回本实例本地 enqueue sink 因队列满而丢弃的日志数量。"""
+        """Return records dropped by queue overflow or serialization failure."""
         current = sum(
             int(getattr(handler, "dropped_messages", 0))
             for handler in getattr(self.logger._core, "handlers", {}).values()
             if getattr(handler, "_id", None) in self._handler_ids
         )
         return self._dropped_messages_total + current
+
+    def get_queue_serialization_errors(self) -> int:
+        """Return multiprocessing records rejected before queue insertion."""
+        current = sum(
+            int(getattr(handler, "serialization_errors", 0))
+            for handler in getattr(self.logger._core, "handlers", {}).values()
+            if getattr(handler, "_id", None) in self._handler_ids
+        )
+        return self._serialization_errors_total + current
 
     def get_queue_status(self) -> Dict[str, Any]:
         """Return the configured queue policy and the cumulative drop count."""
@@ -696,7 +810,9 @@ class YydsLogger:
             "overflow_policy": self.overflow_policy,
             "timeout": self.queue_timeout,
             "backend": self.queue_backend,
+            "shutdown_timeout": self.shutdown_timeout,
             "dropped_messages": self.get_queue_dropped(),
+            "serialization_errors": self.get_queue_serialization_errors(),
         }
 
     def get_health(self) -> Dict[str, Any]:
@@ -709,7 +825,8 @@ class YydsLogger:
             "enqueue": bool(self.enqueue),
             "queue_backend": self.queue_backend,
             "queue_dropped": self.get_queue_dropped(),
-            "handler_count": len(self._handler_ids),
+            "queue_serialization_errors": self.get_queue_serialization_errors(),
+            "handler_count": len(getattr(self.logger._core, "handlers", {})),
         }
         return result
 
@@ -749,6 +866,7 @@ class YydsLogger:
 
         配合 serialize=True 时，这些字段会自动出现在 JSON 日志中。
         """
+        self._ensure_open()
         return self.logger.bind(**kwargs)
 
     def contextualize(self, **kwargs):
@@ -758,6 +876,7 @@ class YydsLogger:
             with logger.contextualize(trace_id="abc", span_id="01"):
                 logger.info("处理中")
         """
+        self._ensure_open()
         return self.logger.contextualize(**kwargs)
 
     def set_request_id(self, request_id: str):
@@ -778,31 +897,47 @@ class YydsLogger:
         # 防止初始化异常时 _logger_d1 尚未创建导致无限递归
         if name.startswith('_'):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        self._ensure_open()
         try:
             return getattr(self._logger_d1, name)
         except AttributeError:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def log(self, level: str, message: str, *args, **kwargs):
+        self._ensure_open()
         return self._logger_d1.log(level, message, *args, **kwargs)
 
     def debug(self, message: str, *args, **kwargs):
+        self._ensure_open()
         return self._logger_d1.debug(message, *args, **kwargs)
 
     def info(self, message: str, *args, **kwargs):
+        self._ensure_open()
         return self._logger_d1.info(message, *args, **kwargs)
 
     def warning(self, message: str, *args, **kwargs):
+        self._ensure_open()
         return self._logger_d1.warning(message, *args, **kwargs)
 
     def error(self, message: str, *args, **kwargs):
+        self._ensure_open()
         return self._logger_d1.error(message, *args, **kwargs)
 
     def critical(self, message: str, *args, **kwargs):
+        self._ensure_open()
         return self._logger_d1.critical(message, *args, **kwargs)
 
     def exception(self, message: str, *args, **kwargs):
+        self._ensure_open()
         return self._logger_d1.exception(message, *args, **kwargs)
+
+    def success(self, message: str, *args, **kwargs):
+        self._ensure_open()
+        return self._logger_d1.success(message, *args, **kwargs)
+
+    def trace(self, message: str, *args, **kwargs):
+        self._ensure_open()
+        return self._logger_d1.trace(message, *args, **kwargs)
 
     def log_decorator(self, msg=None, level="ERROR", trace=True, reraise=True):
         from .decorators import log_decorator
@@ -1007,24 +1142,85 @@ class YydsLogger:
         self.cleanup()
         return False
 
+    async def __aenter__(self):
+        """Support ``async with`` for non-blocking shutdown."""
+        self._ensure_open()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.aclose()
+        return False
+
+    def _has_enqueued_handlers(self) -> bool:
+        return any(
+            bool(getattr(handler, "_enqueue", False))
+            for handler in getattr(self.logger._core, "handlers", {}).values()
+        )
+
+    async def _run_in_worker(self, function, *args):
+        """Run blocking shutdown work while yielding to the active event loop."""
+        done = threading.Event()
+        outcome = {}
+
+        def run():
+            try:
+                outcome["result"] = function(*args)
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=run,
+            daemon=True,
+            name="yyds-logger-shutdown",
+        )
+        worker.start()
+        while not done.is_set():
+            await asyncio.sleep(0.01)
+        worker.join()
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome.get("result")
+
     def flush(self) -> None:
         """排空当前实例的 enqueue 队列，但保留 logger 继续使用。"""
-        if not self.enqueue or not self._handler_ids:
+        self._ensure_open()
+        if not self._has_enqueued_handlers():
             return
-        try:
-            self._run_complete()
-        except RuntimeError:
-            raise RuntimeError(self._msg("ERR_RUNNING_LOOP"))
+        self._run_complete()
 
     async def flush_async(self) -> None:
-        """异步排空当前实例的 enqueue 队列，但保留 logger 继续使用。"""
-        if not self.enqueue or not self._handler_ids:
-            return
-        await self.logger.complete()
+        """Without blocking the event loop, drain queues and async sinks."""
+        self._ensure_open()
+        completer = await self._run_in_worker(self.logger.complete)
+        await completer
 
     def close(self) -> None:
         """关闭 logger 并释放资源；cleanup() 的明确别名。"""
         self.cleanup()
+
+    async def aclose(self) -> None:
+        """Close the logger without blocking the running event loop."""
+        state = getattr(self, "_cleanup_state", "open")
+        if state in {"closed", "closing"}:
+            return
+        if state == "open":
+            await self.flush_async()
+
+        with self._config_lock:
+            if not self._begin_cleanup():
+                return
+        try:
+            await self._run_in_worker(self._retry_failed_handler_stops, True)
+            await self._run_in_worker(self._remove_handlers, False, True)
+            await self._run_in_worker(self._remove_remaining_handlers, True)
+        except Exception:
+            with self._config_lock:
+                self._cleanup_state = "failed"
+            raise
+        with self._config_lock:
+            self._finish_cleanup()
 
     def cleanup(self) -> None:
         """清理资源，释放 enqueue 队列和信号灯。
@@ -1035,10 +1231,23 @@ class YydsLogger:
             self._cleanup()
 
     def _cleanup(self) -> None:
+        if not self._begin_cleanup():
+            return
+        try:
+            self._retry_failed_handler_stops(strict=True)
+            # wait=True drains managed queues before retiring their sinks.
+            self._remove_handlers(wait=True, strict=True)
+            self._remove_remaining_handlers(strict=True)
+        except Exception:
+            self._cleanup_state = "failed"
+            raise
+        self._finish_cleanup()
+
+    def _begin_cleanup(self) -> bool:
         if getattr(self, "_cleanup_state", "open") == "closed":
-            return
+            return False
         if getattr(self, "_cleanup_state", "open") == "closing":
-            return
+            return False
         self._cleanup_state = "closing"
 
         try:
@@ -1050,13 +1259,12 @@ class YydsLogger:
 
             self._restore_signal_handlers()
             self._release_global_resource("signal_handlers")
-
-            # wait=True: 等待 enqueue 队列排空，确保信号灯正确释放
-            self._remove_handlers(wait=True)
         except Exception:
             self._cleanup_state = "failed"
             raise
+        return True
 
+    def _finish_cleanup(self) -> None:
         # Only unregister after every retryable cleanup phase has succeeded.
         # If a manual cleanup fails, atexit still gets a final chance.
         try:

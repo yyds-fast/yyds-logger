@@ -1,10 +1,12 @@
 import functools
 import json
+import math
 import multiprocessing
 import os
 import queue
 import threading
 from contextlib import contextmanager
+from multiprocessing.reduction import ForkingPickler
 from threading import Thread
 
 from ._colorizer import Colorizer
@@ -46,6 +48,7 @@ class Handler:
         overflow_policy,
         queue_timeout,
         queue_backend,
+        shutdown_timeout,
         multiprocessing_context,
         error_interceptor,
         exception_formatter,
@@ -65,6 +68,7 @@ class Handler:
         self._overflow_policy = str(overflow_policy).lower()
         self._queue_timeout = queue_timeout
         self._queue_backend = str(queue_backend).lower()
+        self._shutdown_timeout = shutdown_timeout
         if self._overflow_policy not in {"block", "drop"}:
             raise ValueError("overflow_policy must be 'block' or 'drop'")
         if self._queue_timeout is not None and float(self._queue_timeout) < 0:
@@ -73,7 +77,13 @@ class Handler:
             raise ValueError("queue_backend must be 'multiprocessing' or 'thread'")
         if self._queue_backend == "thread" and multiprocessing_context is not None:
             raise ValueError("queue_backend='thread' cannot use a multiprocessing context")
+        if self._shutdown_timeout is not None and (
+            float(self._shutdown_timeout) <= 0
+            or not math.isfinite(float(self._shutdown_timeout))
+        ):
+            raise ValueError("shutdown_timeout must be > 0")
         self._dropped_messages = 0
+        self._serialization_errors = 0
         self._multiprocessing_context = multiprocessing_context
         self._error_interceptor = error_interceptor
         self._exception_formatter = exception_formatter
@@ -219,24 +229,42 @@ class Handler:
             str_record = Message(formatted)
             str_record.record = record
 
+            serialization_error = None
             with self._protected_lock():
                 if self._stopped:
                     return
                 if self._enqueue:
+                    if self._queue_backend == "multiprocessing":
+                        try:
+                            # ``multiprocessing.Queue`` normally pickles in its feeder thread.
+                            # Validate synchronously so serialization failures are observable and
+                            # included in the dropped-message counter instead of being silently
+                            # printed by the feeder after ``put()`` has already returned.
+                            ForkingPickler.dumps(str_record)
+                        except Exception as exc:
+                            self._dropped_messages += 1
+                            self._serialization_errors += 1
+                            serialization_error = exc
                     try:
-                        if self._overflow_policy == "drop":
+                        if serialization_error is not None:
+                            pass
+                        elif self._overflow_policy == "drop":
                             self._queue.put_nowait(str_record)
                         elif self._queue_timeout is None:
                             self._queue.put(str_record)
                         else:
                             self._queue.put(str_record, timeout=float(self._queue_timeout))
                     except Exception as exc:
-                        if exc.__class__.__name__ == "Full":
+                        if isinstance(exc, queue.Full):
                             self._dropped_messages += 1
                             return
                         raise
                 else:
                     self._sink.write(str_record)
+            if serialization_error is not None:
+                if not self._error_interceptor.should_catch():
+                    raise serialization_error
+                self._error_interceptor.print(record, exception=serialization_error)
         except Exception:
             if not self._error_interceptor.should_catch():
                 raise
@@ -248,8 +276,12 @@ class Handler:
             if self._enqueue:
                 if self._owner_process_pid != os.getpid():
                     return
-                self._queue.put(None)
-                self._thread.join()
+                self._put_control(None)
+                self._thread.join(timeout=self._shutdown_timeout)
+                if self._thread.is_alive():
+                    raise TimeoutError(
+                        "Timed out while stopping Loguru handler #%d" % self._id
+                    )
                 if hasattr(self._queue, "close"):
                     self._queue.close()
 
@@ -260,9 +292,25 @@ class Handler:
             return
 
         with self._confirmation_lock:
-            self._queue.put(True)
-            self._confirmation_event.wait()
             self._confirmation_event.clear()
+            self._put_control(True)
+            confirmed = self._confirmation_event.wait(timeout=self._shutdown_timeout)
+            self._confirmation_event.clear()
+            if not confirmed:
+                raise TimeoutError(
+                    "Timed out while flushing Loguru handler #%d" % self._id
+                )
+
+    def _put_control(self, message):
+        try:
+            if self._shutdown_timeout is None:
+                self._queue.put(message)
+            else:
+                self._queue.put(message, timeout=float(self._shutdown_timeout))
+        except queue.Full as exc:
+            raise TimeoutError(
+                "Timed out while controlling Loguru handler #%d" % self._id
+            ) from exc
 
     def tasks_to_complete(self):
         if self._enqueue and self._owner_process_pid != os.getpid():
@@ -274,6 +322,10 @@ class Handler:
     @property
     def dropped_messages(self):
         return self._dropped_messages
+
+    @property
+    def serialization_errors(self):
+        return self._serialization_errors
 
     def update_format(self, level_id):
         if not self._colorize or self._is_formatter_dynamic:
