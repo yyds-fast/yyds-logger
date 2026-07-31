@@ -244,11 +244,17 @@ def test_async_sink_flush_honors_end_to_end_timeout(tmp_path):
         async def sink(message):
             await asyncio.sleep(5)
 
-        logger.add(sink, format="{message}")
+        handler_id = logger.add(sink, format="{message}")
         logger.info("slow-async-sink")
+        # Keep a strong reference so the cancelled task remains visible to
+        # the retry below (this is what Python 3.12 does while the timeout
+        # traceback is still alive).
+        handler = logger.logger._core.handlers[handler_id]
+        retained_task = next(iter(handler._sink._tasks))
         with pytest.raises(TimeoutError):
             await logger.flush_async()
         assert logger._cleanup_state == "open"
+        assert retained_task.cancelled()
         await logger.aclose()
 
     asyncio.run(scenario())

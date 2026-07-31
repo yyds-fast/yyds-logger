@@ -115,6 +115,15 @@ class AsyncSink:
         loop = get_running_loop()
         if get_task_loop(task) is not loop:
             return
+        if task.cancelled():
+            # A previous bounded completion may have cancelled this sink task
+            # and retained it briefly (Python 3.12+ does this while the
+            # waiter's traceback is alive).  It is already terminal, so a
+            # later cleanup retry should treat it as completed.  Keep this
+            # check outside the await: cancellation of the *current* waiter
+            # must still propagate so ``asyncio.wait_for()`` reports its
+            # timeout correctly.
+            return
         try:
             await task
         except Exception:
