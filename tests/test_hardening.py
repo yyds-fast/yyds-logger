@@ -5,6 +5,7 @@ import io
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -13,6 +14,18 @@ import pytest
 from yyds_logger import LogHealthChecker, YydsLogger
 from yyds_logger.i18n import LANG_MAP
 from yyds_logger.profiling import _trace_sync
+
+
+def test_vendored_global_logger_is_initialized_lazily():
+    code = """
+import importlib
+module = importlib.import_module('yyds_logger.yyds_loguru')
+assert module._default_logger is None
+module.create_logger(stderr=False, register_atexit=False)
+assert module._default_logger is None
+assert module.logger is module._default_logger
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_cleanup_drains_current_instance(tmp_path):
@@ -172,6 +185,101 @@ def test_async_context_manager_flushes_and_closes(tmp_path):
     ).read_text(encoding="utf-8")
 
 
+def test_async_close_rejects_new_records_before_drain(tmp_path):
+    async def scenario():
+        logger = YydsLogger(
+            "async-closing-gate",
+            log_dir=str(tmp_path),
+            enqueue=False,
+            console_level="CRITICAL",
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def sink(message):
+            entered.set()
+            await release.wait()
+
+        logger.add(sink, format="{message}")
+        logger.info("before-close")
+        await entered.wait()
+
+        close_task = asyncio.create_task(logger.aclose())
+        while logger._cleanup_state != "closing":
+            await asyncio.sleep(0)
+        with pytest.raises(RuntimeError):
+            logger.info("must-be-rejected")
+        release.set()
+        await close_task
+        assert logger._cleanup_state == "closed"
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_async_close_waits_for_same_shutdown(tmp_path):
+    async def scenario():
+        logger = YydsLogger(
+            "concurrent-async-close",
+            log_dir=str(tmp_path),
+            console_level="CRITICAL",
+        )
+        logger.info("close-once")
+        await asyncio.gather(logger.aclose(), logger.aclose())
+        assert logger._cleanup_state == "closed"
+        assert logger.logger._core.handlers == {}
+
+    asyncio.run(scenario())
+
+
+def test_async_sink_flush_honors_end_to_end_timeout(tmp_path):
+    async def scenario():
+        logger = YydsLogger(
+            "async-sink-timeout",
+            log_dir=str(tmp_path),
+            enqueue=False,
+            console_level="CRITICAL",
+            shutdown_timeout=0.05,
+        )
+
+        async def sink(message):
+            await asyncio.sleep(5)
+
+        logger.add(sink, format="{message}")
+        logger.info("slow-async-sink")
+        with pytest.raises(TimeoutError):
+            await logger.flush_async()
+        assert logger._cleanup_state == "open"
+        await logger.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_blocked_user_sink_stop_times_out_and_can_be_retried(tmp_path):
+    release = threading.Event()
+
+    class BlockingSink:
+        def write(self, message):
+            return None
+
+        def stop(self):
+            release.wait()
+
+    logger = YydsLogger(
+        "bounded-user-stop",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="CRITICAL",
+        shutdown_timeout=0.05,
+    )
+    logger.add(BlockingSink(), format="{message}")
+    with pytest.raises((RuntimeError, TimeoutError)):
+        logger.cleanup()
+    assert logger._cleanup_state == "failed"
+    release.set()
+    logger.cleanup()
+    assert logger._cleanup_state == "closed"
+
+
 def test_flush_timeout_is_bounded_and_retryable(tmp_path, monkeypatch):
     logger = YydsLogger(
         "flush-timeout",
@@ -238,6 +346,36 @@ def test_serialized_file_output_is_valid_json(tmp_path):
     assert records[-1]["record"]["extra"]["request_id"] == "-"
 
 
+def test_deferred_thread_writer_formats_json_file(tmp_path):
+    logger = YydsLogger(
+        "deferred-serialized",
+        log_dir=str(tmp_path),
+        serialize=True,
+        queue_backend="thread",
+        defer_format=True,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    try:
+        file_handler = next(
+            item for item in logger.logger._core.handlers.values() if item._enqueue
+        )
+        assert file_handler._defer_format is True
+        logger.bind(trace_id="deferred").info("deferred {}", "message")
+        logger.flush()
+    finally:
+        logger.cleanup()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "deferred-serialized.log")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert records[-1]["record"]["message"] == "deferred message"
+    assert records[-1]["record"]["extra"]["trace_id"] == "deferred"
+
+
 def test_contextualize_does_not_leak_after_scope(tmp_path):
     logger = YydsLogger("context", log_dir=str(tmp_path),
                         serialize=True, enqueue=False)
@@ -292,21 +430,19 @@ def test_default_sinks_do_not_filter_trace_level(tmp_path):
     assert "trace-marker" in (tmp_path / "unfiltered.log").read_text(encoding="utf-8")
 
 
-def test_size_rotation_applies_to_main_file(tmp_path, monkeypatch):
+def test_size_rotation_applies_to_main_file(tmp_path):
     logger = YydsLogger("size-rotation", log_dir=str(tmp_path), enqueue=False)
-    original_add = logger.logger.add
-    seen_rotations = []
-
-    def record_add(sink, *args, **kwargs):
-        if isinstance(sink, str):
-            seen_rotations.append(kwargs.get("rotation"))
-        return original_add(sink, *args, **kwargs)
 
     try:
-        monkeypatch.setattr(logger.logger, "add", record_add)
         logger.max_size = 20
         logger.configure_logger()
-        assert seen_rotations == ["20 MB"]
+        file_handler = next(
+            handler
+            for handler in logger.logger._core.handlers.values()
+            if hasattr(getattr(handler, "_sink", None), "_rotation_function")
+        )
+        rotation = file_handler._sink._rotation_function
+        assert rotation.keywords["size_limit"] == 20_000_000.0
     finally:
         logger.cleanup()
 
@@ -486,6 +622,39 @@ def test_local_sink_queue_configuration(tmp_path):
         logger.cleanup()
 
 
+def test_queue_status_classifies_block_timeout_drops(tmp_path):
+    class SlowSink:
+        def write(self, message):
+            time.sleep(0.02)
+
+    logger = YydsLogger(
+        "queue-reasons",
+        log_dir=str(tmp_path),
+        queue_size=1,
+        overflow_policy="block",
+        queue_timeout=0,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    logger.add(
+        SlowSink(),
+        enqueue=True,
+        queue_size=1,
+        overflow_policy="block",
+        queue_timeout=0,
+        format="{message}",
+    )
+    try:
+        for index in range(20):
+            logger.info("burst {}", index)
+        status = logger.get_queue_status()
+        assert status["drop_reasons"]["block_timeout"] > 0
+        assert status["dropped_messages"] >= status["drop_reasons"]["block_timeout"]
+        assert "handlers" in status
+    finally:
+        logger.cleanup()
+
+
 def test_multiprocessing_serialization_failure_is_counted(tmp_path):
     stderr = io.StringIO()
     with contextlib.redirect_stderr(stderr):
@@ -537,15 +706,20 @@ def test_queue_status_and_health_include_logger_state(tmp_path):
     )
     try:
         queue_status = logger.get_queue_status()
-        assert queue_status == {
-            "enabled": False,
-            "size": 12,
-            "overflow_policy": "drop",
-            "timeout": 1.0,
-            "backend": "thread",
-            "shutdown_timeout": 30.0,
-            "dropped_messages": 0,
-            "serialization_errors": 0,
+        assert queue_status["enabled"] is False
+        assert queue_status["size"] == 12
+        assert queue_status["capacity"] == 0
+        assert queue_status["depth"] == 0
+        assert queue_status["overflow_policy"] == "drop"
+        assert queue_status["timeout"] == 1.0
+        assert queue_status["backend"] == "thread"
+        assert queue_status["shutdown_timeout"] == 30.0
+        assert queue_status["dropped_messages"] == 0
+        assert queue_status["serialization_errors"] == 0
+        assert queue_status["drop_reasons"] == {
+            "overflow": 0,
+            "block_timeout": 0,
+            "serialization": 0,
         }
         health = logger.get_health()
         assert health["logger"]["state"] == "open"
@@ -863,6 +1037,53 @@ def test_global_hooks_are_restored(tmp_path):
     assert threading.excepthook is previous_thread_hook
     assert signal.getsignal(signal.SIGTERM) is previous_signals[signal.SIGTERM]
     assert signal.getsignal(signal.SIGINT) is previous_signals[signal.SIGINT]
+
+
+def test_signal_handler_notifies_background_cleanup(tmp_path):
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_called = threading.Event()
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    cleanup_threads = []
+
+    def application_handler(signum, frame):
+        previous_called.set()
+
+    signal.signal(signal.SIGTERM, application_handler)
+    logger = YydsLogger(
+        "signal-notification",
+        log_dir=str(tmp_path),
+        console_level="CRITICAL",
+    )
+    original_cleanup = logger.cleanup
+
+    def blocking_cleanup():
+        cleanup_threads.append(threading.current_thread().name)
+        cleanup_started.set()
+        release_cleanup.wait()
+        original_cleanup()
+
+    logger.cleanup = blocking_cleanup
+    try:
+        logger.setup_signal_handlers()
+        installed = signal.getsignal(signal.SIGTERM)
+        started = time.monotonic()
+        installed(signal.SIGTERM, None)
+        assert time.monotonic() - started < 0.1
+        assert previous_called.wait(timeout=0.5)
+        assert cleanup_started.wait(timeout=0.5)
+        assert cleanup_threads == ["yyds-logger-signal-cleanup"]
+
+        release_cleanup.set()
+        deadline = time.monotonic() + 1
+        while logger._cleanup_state != "closed" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert logger._cleanup_state == "closed"
+    finally:
+        release_cleanup.set()
+        logger.cleanup = original_cleanup
+        logger.cleanup()
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def test_exception_hook_chains_application_hook(tmp_path):

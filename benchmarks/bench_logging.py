@@ -3,7 +3,7 @@
 Examples:
 
     python benchmarks/bench_logging.py --mode all --messages 20000 --threads 4
-    python benchmarks/bench_logging.py --mode enqueue --serialize --json
+    python benchmarks/bench_logging.py --mode enqueue --serialize --defer-format --json
 """
 
 import argparse
@@ -64,6 +64,7 @@ def run_case(args: argparse.Namespace, mode: str) -> Dict[str, Any]:
             queue_backend=args.queue_backend,
             process_isolation=args.process_isolation,
             serialize=args.serialize,
+            defer_format=getattr(args, "defer_format", False) and options["enqueue"],
             compression=None,
             max_size=1024,
             **options
@@ -146,6 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--process-isolation", action="store_true")
     parser.add_argument("--level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     parser.add_argument("--serialize", action="store_true")
+    parser.add_argument("--defer-format", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.messages <= 0:

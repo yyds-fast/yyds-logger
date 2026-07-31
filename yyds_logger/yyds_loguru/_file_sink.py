@@ -5,12 +5,29 @@ import numbers
 import os
 import shutil
 import string
+import threading
+import weakref
 from functools import partial
 from stat import ST_DEV, ST_INO
 
 from . import _string_parsers as string_parsers
 from ._ctime_functions import get_ctime, set_ctime
 from ._datetime import aware_now
+
+
+_FILE_LOCKS = weakref.WeakValueDictionary()
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _get_file_lock(path):
+    """Return a process-local lock shared by sinks targeting the same path."""
+    key = os.path.abspath(str(path))
+    with _FILE_LOCKS_GUARD:
+        lock = _FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _FILE_LOCKS[key] = lock
+        return lock
 
 
 def generate_rename_path(root, ext, creation_time):
@@ -173,6 +190,7 @@ class FileSink:
 
         self._kwargs = {**kwargs, "mode": mode, "buffering": buffering, "encoding": self.encoding}
         self._path = str(path)
+        self._lock = _get_file_lock(self._path)
 
         self._glob_patterns = self._make_glob_patterns(self._path)
         self._rotation_function = self._make_rotation_function(rotation)
@@ -187,29 +205,32 @@ class FileSink:
         self._file_ino = -1
 
         if not delay:
-            path = self._create_path()
-            self._create_dirs(path)
-            self._create_file(path)
+            with self._lock:
+                path = self._create_path()
+                self._create_dirs(path)
+                self._create_file(path)
 
     def write(self, message):
-        if self._file is None:
-            path = self._create_path()
-            self._create_dirs(path)
-            self._create_file(path)
+        with self._lock:
+            if self._file is None:
+                path = self._create_path()
+                self._create_dirs(path)
+                self._create_file(path)
 
-        if self._watch:
-            self._reopen_if_needed()
+            if self._watch:
+                self._reopen_if_needed()
 
-        if self._rotation_function is not None and self._rotation_function(message, self._file):
-            self._terminate_file(is_rotating=True)
+            if self._rotation_function is not None and self._rotation_function(message, self._file):
+                self._terminate_file(is_rotating=True)
 
-        self._file.write(message)
+            self._file.write(message)
 
     def stop(self):
-        if self._watch:
-            self._reopen_if_needed()
+        with self._lock:
+            if self._watch:
+                self._reopen_if_needed()
 
-        self._terminate_file(is_rotating=False)
+            self._terminate_file(is_rotating=False)
 
     def tasks_to_complete(self):
         return []

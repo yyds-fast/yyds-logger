@@ -131,9 +131,16 @@ class BasicHandlerConfig(TypedDict, total=False):
     filter: Optional[Union[str, FilterFunction, FilterDict]]
     colorize: Optional[bool]
     serialize: bool
+    defer_format: bool
     backtrace: bool
     diagnose: bool
     enqueue: bool
+    queue_size: Optional[int]
+    overflow_policy: str
+    queue_timeout: Optional[float]
+    queue_backend: str
+    shutdown_timeout: Optional[float]
+    context: Optional[Union[str, BaseContext]]
     catch: bool
 
 class FileHandlerConfig(TypedDict, total=False):
@@ -143,9 +150,16 @@ class FileHandlerConfig(TypedDict, total=False):
     filter: Optional[Union[str, FilterFunction, FilterDict]]
     colorize: Optional[bool]
     serialize: bool
+    defer_format: bool
     backtrace: bool
     diagnose: bool
     enqueue: bool
+    queue_size: Optional[int]
+    overflow_policy: str
+    queue_timeout: Optional[float]
+    queue_backend: str
+    shutdown_timeout: Optional[float]
+    context: Optional[Union[str, BaseContext]]
     catch: bool
     rotation: Optional[Union[str, int, time, timedelta, RotationFunction]]
     retention: Optional[Union[str, int, timedelta, RetentionFunction]]
@@ -167,9 +181,15 @@ class AsyncHandlerConfig(TypedDict, total=False):
     filter: Optional[Union[str, FilterFunction, FilterDict]]
     colorize: Optional[bool]
     serialize: bool
+    defer_format: bool
     backtrace: bool
     diagnose: bool
     enqueue: bool
+    queue_size: Optional[int]
+    overflow_policy: str
+    queue_timeout: Optional[float]
+    queue_backend: str
+    shutdown_timeout: Optional[float]
     catch: bool
     context: Optional[Union[str, BaseContext]]
     loop: Optional[AbstractEventLoop]
@@ -196,6 +216,7 @@ class Logger:
         filter: Optional[Union[str, FilterFunction, FilterDict]] = ...,
         colorize: Optional[bool] = ...,
         serialize: bool = ...,
+        defer_format: bool = ...,
         backtrace: bool = ...,
         diagnose: bool = ...,
         enqueue: bool = ...,
@@ -217,6 +238,7 @@ class Logger:
         filter: Optional[Union[str, FilterFunction, FilterDict]] = ...,
         colorize: Optional[bool] = ...,
         serialize: bool = ...,
+        defer_format: bool = ...,
         backtrace: bool = ...,
         diagnose: bool = ...,
         enqueue: bool = ...,
@@ -239,6 +261,7 @@ class Logger:
         filter: Optional[Union[str, FilterFunction, FilterDict]] = ...,
         colorize: Optional[bool] = ...,
         serialize: bool = ...,
+        defer_format: bool = ...,
         backtrace: bool = ...,
         diagnose: bool = ...,
         enqueue: bool = ...,
@@ -262,8 +285,8 @@ class Logger:
         closefd: bool = ...,
         opener: Optional[StandardOpener] = ...,
     ) -> int: ...
-    def remove(self, handler_id: Optional[int] = ...) -> None: ...
-    def complete(self) -> AwaitableCompleter: ...
+    def remove(self, handler_id: Optional[int] = ..., *, timeout: Optional[float] = ...) -> None: ...
+    def complete(self, timeout: Optional[float] = ...) -> AwaitableCompleter: ...
     @overload
     def catch(
         self,

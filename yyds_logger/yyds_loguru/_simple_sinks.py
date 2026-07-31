@@ -86,7 +86,22 @@ class AsyncSink:
 
     def stop(self):
         for task in self._tasks:
-            task.cancel()
+            if task.done():
+                continue
+            loop = get_task_loop(task)
+            try:
+                current_loop = get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            try:
+                if current_loop is loop or not loop.is_running():
+                    task.cancel()
+                else:
+                    loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                # The owning loop may already be closed.  There is no safe
+                # thread on which the task can be cancelled at this point.
+                pass
 
     def tasks_to_complete(self):
         # To avoid errors due to "self._tasks" being mutated while iterated, the

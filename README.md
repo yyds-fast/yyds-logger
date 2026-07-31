@@ -12,6 +12,8 @@
 - **接管标准库 logging**：把 uvicorn / sqlalchemy 等三方库日志统一汇入本管道（通过 `sys._getframe` C 级原生帧跳过深度优化性能）
 - **环境感知（env='prod'/'dev'）**：默认为 `'prod'` (生产环境优先)，生产自动关闭 diagnose/backtrace，使用异步文件写入
 - **有界本地队列**：支持 `queue_size`、`block/drop` 溢出策略和 `queue_timeout`
+- **writer 侧延迟格式化**：线程队列可用 `defer_format=True` 将格式化、异常渲染和 JSON
+  序列化移到 writer，降低业务线程日志延迟
 - **按 sink 独立级别**：控制台、主文件可各自设置级别
 - request_id 上下文注入（ContextVar）+ `bind/contextualize` 结构化字段与 trace 关联
 - 装饰器记录函数调用与耗时（同步/异步），级别关闭时自动跳过昂贵格式化
@@ -152,10 +154,27 @@ logger = YydsLogger(
 1 秒，flush/close 的每次队列控制或 writer join 默认最多等待 30 秒。将
 `shutdown_timeout` 设为 `None` 可恢复无限等待。
 
+当格式化本身（动态 format、异常回溯或 JSON 序列化）较重时，可对本地文件 sink 打开
+`defer_format=True`。它要求 `enqueue=True` 且 `queue_backend="thread"`，日志调用只复制当时的
+record 快照并入队，实际格式化由 writer 执行；因此动态 format 函数的执行线程和执行时机也会改变。
+
 `queue_backend="auto"` 默认使用进程内线程队列，避免 pickle、IPC、额外 feeder 线程和文件描述符开销。
 多进程部署配合 `process_isolation=True` 时，每个 worker 同样使用自己的线程队列和 PID 文件。
 只有确实依赖 multiprocessing 队列语义时才应显式选择 `"multiprocessing"`；不可 pickle 的结构化字段
 会被拒绝并计入 `dropped_messages` 与 `serialization_errors`，可通过 `get_queue_status()` 查看。
+
+运行中可读取队列深度、容量、利用率、writer 状态和各类丢弃原因：
+
+```python
+status = logger.get_queue_status()
+print(status["depth"], status["utilization"], status["drop_reasons"])
+```
+
+需要切换格式、级别或队列策略时，可用 `reconfigure()` 原子替换本实例管理的 sinks；失败时旧配置会继续生效：
+
+```python
+logger.reconfigure(file_level="DEBUG", defer_format=True)
+```
 
 如需精细控制，可用 `enqueue` / `diagnose` / `backtrace` 三个可选参数显式覆盖：
 
@@ -240,7 +259,8 @@ logger = YydsLogger(
 
 ### 优雅退出（SIGTERM）
 
-容器 / k8s 用 SIGTERM 停服时 `atexit` 不一定触发，开启后会在退出前排空 enqueue 队列，避免丢日志：
+容器 / k8s 用 SIGTERM 停服时 `atexit` 不一定触发，开启后信号处理器只发送通知，后台清理线程
+负责在有界超时内排空 enqueue 队列，避免在 Python 信号上下文中执行文件 I/O：
 
 ```python
 logger = YydsLogger("app")
@@ -398,6 +418,7 @@ logger = YydsLogger(
     queue_timeout=1.0,                  # block 模式最大等待时间；None 表示无限等待
     queue_backend="auto",              # 默认解析为 thread
     shutdown_timeout=30.0,              # 队列控制或 writer join 的单次等待上限
+    defer_format=False,                 # 在线程队列 writer 侧执行格式化/序列化
     process_isolation=False,            # 多进程部署时必须改为 True
 )
 ```

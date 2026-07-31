@@ -129,6 +129,61 @@ def restore_exception_handler(logger) -> None:
     logger._prev_threading_excepthook = None
 
 
+def _start_signal_cleanup_worker(logger) -> None:
+    """Start/restart the process-local worker used by signal notifications."""
+    existing = getattr(logger, "_signal_cleanup_thread", None)
+    if existing is not None and existing.is_alive():
+        return
+
+    cleanup_event = threading.Event()
+    cleanup_stop = threading.Event()
+    logger._signal_cleanup_event = cleanup_event
+    logger._signal_cleanup_stop = cleanup_stop
+    logger._signal_cleanup_default_signal = None
+    logger._signal_cleanup_error = None
+
+    def cleanup_worker() -> None:
+        while True:
+            cleanup_event.wait()
+            cleanup_event.clear()
+            if cleanup_stop.is_set():
+                return
+            try:
+                logger.cleanup()
+            except BaseException as exc:
+                # ``cleanup()`` records its state and remains retryable. Keep
+                # the exception available for diagnostics without allowing a
+                # daemon-thread traceback to terminate the application.
+                logger._signal_cleanup_error = exc
+
+            # Defer the default action until queues have had a chance to
+            # drain. A ``None`` frame denotes a direct/manual hook call; do
+            # not terminate the hosting process in that case.
+            pending_signal = logger._signal_cleanup_default_signal
+            logger._signal_cleanup_default_signal = None
+            if pending_signal is not None:
+                try:
+                    os.kill(os.getpid(), pending_signal)
+                except OSError:
+                    pass
+                return
+
+            if cleanup_stop.is_set():
+                return
+
+    cleanup_thread = threading.Thread(
+        target=cleanup_worker,
+        daemon=True,
+        name="yyds-logger-signal-cleanup",
+    )
+    logger._signal_cleanup_thread = cleanup_thread
+    try:
+        cleanup_thread.start()
+    except Exception:
+        logger._signal_cleanup_thread = None
+        raise
+
+
 def setup_signal_handlers(logger) -> None:
     if threading.current_thread() is not threading.main_thread():
         return
@@ -136,19 +191,48 @@ def setup_signal_handlers(logger) -> None:
         return
     logger._claim_global_resource("signal_handlers")
 
+    # Signal handlers run on the interpreter's main thread and must stay
+    # minimal: queue locks, file I/O and user callbacks are unsafe there.
+    # Start a daemon worker ahead of time and let the actual handler only set
+    # an Event. The worker performs the existing bounded cleanup path.
+    try:
+        _start_signal_cleanup_worker(logger)
+    except Exception:
+        logger._release_global_resource("signal_handlers")
+        raise
+
     def handler(signum, frame):
         previous = logger._prev_signal_handlers.get(signum)
-        try:
-            logger.cleanup()
-        except Exception:
-            pass
+        # ``signal.signal()`` is only legal from the main thread. Restore all
+        # handlers here before handing cleanup to the worker, otherwise the
+        # worker's normal cleanup path could never release this resource.
+        remaining_previous = {}
+        remaining_installed = {}
+        for installed_signal, previous_handler in list(
+            logger._prev_signal_handlers.items()
+        ):
+            installed = logger._signal_handlers.get(installed_signal)
+            try:
+                if installed is not None and signal.getsignal(installed_signal) is installed:
+                    signal.signal(installed_signal, previous_handler)
+            except Exception:
+                remaining_previous[installed_signal] = previous_handler
+                if installed is not None:
+                    remaining_installed[installed_signal] = installed
+        logger._prev_signal_handlers = remaining_previous
+        logger._signal_handlers = remaining_installed
+        if previous == signal.SIG_DFL and frame is not None:
+            logger._signal_cleanup_default_signal = signum
+        logger._signal_cleanup_event.set()
         if callable(previous):
-            previous(signum, frame)
+            try:
+                previous(signum, frame)
+            except Exception:
+                pass
         elif previous == signal.SIG_IGN:
             return
-        else:
-            signal.signal(signum, signal.SIG_DFL)
-            os.kill(os.getpid(), signum)
+        # The default action is re-issued by the worker after cleanup. This
+        # keeps SIGTERM/SIGINT graceful while preserving normal termination.
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -159,10 +243,23 @@ def setup_signal_handlers(logger) -> None:
             logger._prev_signal_handlers.pop(sig, None)
             continue
     if not logger._signal_handlers:
+        logger._signal_cleanup_stop.set()
+        logger._signal_cleanup_event.set()
+        logger._signal_cleanup_thread = None
         logger._release_global_resource("signal_handlers")
 
 
 def restore_signal_handlers(logger) -> None:
+    cleanup_stop = getattr(logger, "_signal_cleanup_stop", None)
+    cleanup_event = getattr(logger, "_signal_cleanup_event", None)
+    if cleanup_stop is not None:
+        cleanup_stop.set()
+    if cleanup_event is not None:
+        # Wake a worker which is waiting for its first notification. Do not
+        # join it here: when the worker itself owns cleanup, joining would
+        # deadlock, and it is daemonized by design.
+        cleanup_event.set()
+
     if not logger._prev_signal_handlers:
         return
     remaining_previous = {}

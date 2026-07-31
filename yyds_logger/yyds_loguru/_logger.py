@@ -98,6 +98,7 @@ from multiprocessing import current_process, get_context
 from multiprocessing.context import BaseContext
 from os.path import basename, splitext
 from threading import current_thread
+from time import monotonic
 
 from . import _asyncio_loop, _colorama, _defaults, _filters
 from ._better_exceptions import ExceptionFormatter
@@ -250,6 +251,7 @@ class Logger:
         filter=_defaults.LOGURU_FILTER,
         colorize=_defaults.LOGURU_COLORIZE,
         serialize=_defaults.LOGURU_SERIALIZE,
+        defer_format=False,
         backtrace=_defaults.LOGURU_BACKTRACE,
         diagnose=_defaults.LOGURU_DIAGNOSE,
         enqueue=_defaults.LOGURU_ENQUEUE,
@@ -283,6 +285,11 @@ class Logger:
         serialize : |bool|, optional
             Whether the logged message and its records should be first converted to a JSON string
             before being sent to the sink.
+        defer_format : |bool|, optional
+            Whether formatting, exception rendering and serialization should be performed by the
+            in-process queue writer instead of the caller thread. This is only supported when
+            ``enqueue=True`` and ``queue_backend="thread"``. It is useful for high-throughput
+            local file sinks; the record is snapshotted when the logging call is made.
         backtrace : |bool|, optional
             Whether the exception trace formatted should be extended upward, beyond the catching
             point, to show the full stacktrace which generated the error.
@@ -293,6 +300,19 @@ class Logger:
             Whether the messages to be logged should first pass through a multiprocessing-safe queue
             before reaching the sink. This is useful while logging to a file through multiple
             processes. This also has the advantage of making logging calls non-blocking.
+        queue_size : |int| or ``None``, optional
+            Maximum number of records held by an enqueue queue. ``None`` creates an unbounded queue.
+        overflow_policy : |str|, optional
+            Whether a full queue should ``"block"`` or ``"drop"`` the incoming record.
+        queue_timeout : |float| or ``None``, optional
+            Maximum number of seconds a blocking producer waits for queue capacity. ``None`` waits
+            indefinitely.
+        queue_backend : |str|, optional
+            Queue implementation, either ``"multiprocessing"`` or the in-process ``"thread"``
+            backend.
+        shutdown_timeout : |float| or ``None``, optional
+            Maximum number of seconds used by each queue flush, writer join and sink-stop phase.
+            ``None`` waits indefinitely.
         context : |multiprocessing.Context| or |str|, optional
             A context object or name that will be used for all tasks involving internally the
             |multiprocessing| module, in particular when ``enqueue=True``. If ``None``, the default
@@ -1007,6 +1027,7 @@ class Logger:
                 filter_=filter_func,
                 colorize=colorize,
                 serialize=serialize,
+                defer_format=defer_format,
                 enqueue=enqueue,
                 queue_size=queue_size,
                 overflow_policy=overflow_policy,
@@ -1028,7 +1049,7 @@ class Logger:
 
         return handler_id
 
-    def remove(self, handler_id=None):
+    def remove(self, handler_id=None, *, timeout=None):
         """Remove a previously added handler and stop sending logs to its sink.
 
         Parameters
@@ -1065,6 +1086,7 @@ class Logger:
             else:
                 handler_ids = [handler_id]
 
+            deadline = None if timeout is None else monotonic() + max(0.0, float(timeout))
             for handler_id in handler_ids:
                 handlers = self._core.handlers.copy()
                 handler = handlers.pop(handler_id)
@@ -1074,9 +1096,12 @@ class Logger:
                 self._core.min_level = min(levelnos, default=float("inf"))
                 self._core.handlers = handlers
 
-                handler.stop()
+                if deadline is None:
+                    handler.stop()
+                else:
+                    handler.stop(timeout=max(0.0, deadline - monotonic()))
 
-    def complete(self):
+    def complete(self, timeout=None):
         """Wait for the end of enqueued messages and asynchronous tasks scheduled by handlers.
 
         This method proceeds in two steps: first it waits for all logging messages added to handlers
@@ -1128,10 +1153,14 @@ class Logger:
         """
         tasks = []
 
+        deadline = None if timeout is None else monotonic() + max(0.0, float(timeout))
         with self._core.lock:
             handlers = self._core.handlers.copy()
             for handler in handlers.values():
-                handler.complete_queue()
+                if deadline is None:
+                    handler.complete_queue()
+                else:
+                    handler.complete_queue(timeout=max(0.0, deadline - monotonic()))
                 tasks.extend(handler.tasks_to_complete())
 
         class AwaitableCompleter:
