@@ -1510,7 +1510,8 @@ def test_async_sink_with_enqueue_true_schedules_safely(tmp_path):
     assert received == ["hello-enqueued-async"]
 
 
-def test_line_profiler_escapes_backslash_tags_and_supports_recursion(tmp_path):
+def test_line_profiler_escapes_backslash_tags_and_supports_recursion(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "line_profiler", None)
     logger = YydsLogger("prof-escape", log_dir=str(tmp_path), enqueue=False, console_level="CRITICAL")
     try:
         @logger.time_it(line_by_line=True)
