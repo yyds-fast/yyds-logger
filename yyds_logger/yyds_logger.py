@@ -7,14 +7,15 @@
 # Desc  : Enhanced Logger with Loguru (with async support) + Language Option
 
 import os
+import re
 import sys
 import time
-import atexit
 import logging
 import asyncio
 import math
+import traceback
 
-from typing import TYPE_CHECKING, Optional, Dict, Any, List
+from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple
 
 from contextvars import ContextVar
 from datetime import datetime
@@ -28,6 +29,58 @@ from .i18n import LANG_MAP, get_message
 
 if TYPE_CHECKING:
     from .yyds_loguru import Record
+
+
+def _finalize_logger_resources(
+    logger_ref: "weakref.ReferenceType[YydsLogger]",
+    state: List[Any],
+) -> None:
+    """Drain and stop logger resources on GC or process exit without pinning ``self``."""
+    instance = logger_ref()
+    if instance is not None:
+        instance.cleanup()
+        return
+
+    raw_logger, shutdown_timeout = state
+    if raw_logger is None:
+        return
+    try:
+        core = raw_logger._core
+        handlers = list(getattr(core, "handlers", {}).values())
+        if not handlers:
+            return
+        deadline = None if shutdown_timeout is None else monotonic() + float(shutdown_timeout)
+        has_enqueue = any(getattr(h, "_enqueue", False) for h in handlers)
+        has_mp = any(
+            getattr(h, "_enqueue", False) and getattr(h, "_queue_backend", None) == "multiprocessing"
+            for h in handlers
+        )
+        if has_enqueue:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                async def _drain():
+                    rem = None if deadline is None else max(0.0, deadline - monotonic())
+                    completer = raw_logger.complete(timeout=rem)
+                    if deadline is None:
+                        await completer
+                    else:
+                        await asyncio.wait_for(completer, timeout=max(0.0, deadline - monotonic()))
+
+                try:
+                    asyncio.run(_drain())
+                except Exception:
+                    pass
+        rem = None if deadline is None else max(0.0, deadline - monotonic())
+        if deadline is None:
+            raw_logger.remove()
+        else:
+            raw_logger.remove(timeout=rem)
+        if has_mp:
+            import gc
+            gc.collect()
+    except BaseException:
+        pass
 
 
 @dataclass(frozen=True)
@@ -82,6 +135,7 @@ class YydsLogger:
     _process_isolated_instances: weakref.WeakSet = weakref.WeakSet()
     _process_isolated_registry_lock = threading.Lock()
     _process_isolated_at_fork_registered = False
+    _class_fork_locks_registered = False
     _cleanup_owner_thread_id: Optional[int]
     _cleanup_error: Optional[BaseException]
     _active_shutdown_deadline: Optional[float]
@@ -169,7 +223,7 @@ class YydsLogger:
             if isinstance(queue_size, bool) or not isinstance(queue_size, int) or queue_size <= 0:
                 raise TypeError(get_message(language, "ERR_QUEUE_SIZE"))
         self.queue_size = queue_size
-        self.overflow_policy = str(overflow_policy).lower()
+        self.overflow_policy = str(overflow_policy).strip().lower()
         if isinstance(queue_timeout, bool):
             raise ValueError(get_message(language, "ERR_QUEUE_TIMEOUT"))
         try:
@@ -228,6 +282,9 @@ class YydsLogger:
         self._cleanup_owner_thread_id = None
         self._cleanup_error = None
         self._active_shutdown_deadline = None
+        self._cleanup_async_waiters: List[Tuple[asyncio.AbstractEventLoop, asyncio.Future]] = []
+        self._health_checker: Optional[Any] = None
+        self._health_checker_lang: Optional[str] = None
         self._exception_hook = None
         self._threading_exception_hook = None
         self._prev_excepthook = None
@@ -250,8 +307,9 @@ class YydsLogger:
         # 使用 patch 确保每条日志记录都包含 'request_id'
         self._raw_logger = create_logger(stderr=False, register_atexit=False)
         self.logger = self._raw_logger.patch(self._patch_record)
-        # 缓存常用的 opt(depth=1)，减少热路径对象创建开销
+        # 缓存常用的 opt(depth=1/2)，减少热路径对象创建开销
         self._logger_d1 = self.logger.opt(depth=1)
+        self._logger_d2 = self.logger.opt(depth=2)
 
         # 解析运行环境；显式 enqueue/diagnose/backtrace 可覆盖环境默认值。
         self.env = str(env).strip().lower()
@@ -285,29 +343,59 @@ class YydsLogger:
         }
         self._stats_start_time = datetime.now()
         self._stats_ready = True
-        # 注册 atexit 钩子，确保程序退出时自动清理 enqueue 队列和信号灯
-        atexit.register(self.cleanup)
-        self._register_process_isolated_instance()
+        # 使用 weakref.finalize 确保进程退出与 GC 时自动清理队列与句柄，同时避免 atexit 强引用泄漏
+        self._finalizer_state: List[Any] = [self._raw_logger, self.shutdown_timeout]
+        self._finalizer = weakref.finalize(
+            self,
+            _finalize_logger_resources,
+            weakref.ref(self),
+            self._finalizer_state,
+        )
+        self._ensure_class_fork_locks_registered()
+        self._sync_process_isolation_registration()
 
         self._instance_counted = False
 
-    def _register_process_isolated_instance(self) -> None:
-        """Register one lightweight child-fork hook for PID-isolated loggers.
-
-        ``process_isolation`` used to only calculate the PID once in
-        ``__init__``.  A pre-fork server therefore made every worker inherit
-        the master's filename and queue handlers.  Keep weak references so
-        the process-wide hook does not prolong a logger's lifetime.
-        """
-        if not self.process_isolation or not hasattr(os, "register_at_fork"):
+    @classmethod
+    def _ensure_class_fork_locks_registered(cls) -> None:
+        if not hasattr(os, "register_at_fork") or cls._class_fork_locks_registered:
             return
+        with cls._process_isolated_registry_lock:
+            if not cls._class_fork_locks_registered:
+                def _before_fork() -> None:
+                    cls._process_isolated_registry_lock.acquire()
+                    cls._global_resource_lock.acquire()
 
+                def _after_fork() -> None:
+                    try:
+                        cls._global_resource_lock.release()
+                    finally:
+                        cls._process_isolated_registry_lock.release()
+
+                os.register_at_fork(
+                    before=_before_fork,
+                    after_in_parent=_after_fork,
+                    after_in_child=_after_fork,
+                )
+                cls._class_fork_locks_registered = True
+
+    def _sync_process_isolation_registration(self) -> None:
+        """Keep the child-fork registry synchronized with ``self.process_isolation``."""
+        if not hasattr(os, "register_at_fork"):
+            return
         cls = type(self)
         with cls._process_isolated_registry_lock:
-            cls._process_isolated_instances.add(self)
-            if not cls._process_isolated_at_fork_registered:
-                os.register_at_fork(after_in_child=cls._reset_process_isolated_loggers_after_fork)
-                cls._process_isolated_at_fork_registered = True
+            if self.process_isolation:
+                cls._process_isolated_instances.add(self)
+                if not cls._process_isolated_at_fork_registered:
+                    os.register_at_fork(after_in_child=cls._reset_process_isolated_loggers_after_fork)
+                    cls._process_isolated_at_fork_registered = True
+            else:
+                cls._process_isolated_instances.discard(self)
+
+    def _register_process_isolated_instance(self) -> None:
+        """Register one lightweight child-fork hook for PID-isolated loggers."""
+        self._sync_process_isolation_registration()
 
     @classmethod
     def _reset_process_isolated_loggers_after_fork(cls) -> None:
@@ -318,13 +406,12 @@ class YydsLogger:
         instead of attempting to stop queues whose writer threads only exist
         in the parent process.
         """
-        cls._global_resource_lock = threading.RLock()
         for instance in list(cls._process_isolated_instances):
             instance._reset_after_fork()
 
     def _reset_after_fork(self) -> None:
         """Replace parent-owned sinks with fresh child-local PID sinks."""
-        if getattr(self, "_cleanup_state", "open") != "open":
+        if getattr(self, "_cleanup_state", "open") != "open" or not self.process_isolation:
             return
 
         self._config_lock = threading.RLock()
@@ -356,6 +443,9 @@ class YydsLogger:
         self._cleanup_owner_thread_id = None
         self._cleanup_error = None
         self._active_shutdown_deadline = None
+        self._cleanup_async_waiters = []
+        self._health_checker = None
+        self._health_checker_lang = None
         self._signal_cleanup_event = threading.Event()
         self._signal_cleanup_stop = threading.Event()
         self._signal_cleanup_thread = None
@@ -379,6 +469,9 @@ class YydsLogger:
         self._raw_logger = create_logger(stderr=False, register_atexit=False)
         self.logger = self._raw_logger.patch(self._patch_record)
         self._logger_d1 = self.logger.opt(depth=1)
+        self._logger_d2 = self.logger.opt(depth=2)
+        self._finalizer_state[0] = self._raw_logger
+        self._finalizer_state[1] = self.shutdown_timeout
         self._info_level_no = self._safe_level_no("INFO")
         self._refresh_sink_level_nos()
 
@@ -396,7 +489,7 @@ class YydsLogger:
         """Inject request context and collect stats for every logger entry point."""
         record["extra"].setdefault("request_id", self.request_id_var.get() or "-")
         if self._stats_ready and self.enable_stats:
-            self._update_stats(record["level"].name)
+            self._update_stats(record["level"].name, record["level"].no)
 
     def _claim_global_resource(self, resource: str) -> None:
         """Prevent multiple instances from silently overwriting process-wide hooks."""
@@ -425,31 +518,32 @@ class YydsLogger:
     @property
     def config(self) -> LoggerConfig:
         """Return an immutable snapshot of all effective public settings."""
-        return LoggerConfig(
-            file_name=self.file_name,
-            log_dir=self.log_dir,
-            max_size=self.max_size,
-            retention=self.retention,
-            language=self.language,
-            custom_format=self.custom_format,
-            compression=self.compression,
-            enable_stats=bool(self.enable_stats),
-            env=self.env,
-            enqueue=bool(self.enqueue),
-            diagnose=bool(self.diagnose),
-            backtrace=bool(self.backtrace),
-            serialize=bool(self.serialize),
-            console_serialize=bool(self.console_serialize),
-            console_level=self.console_level,
-            file_level=self.file_level,
-            queue_size=self.queue_size,
-            overflow_policy=self.overflow_policy,
-            queue_timeout=self.queue_timeout,
-            process_isolation=bool(self.process_isolation),
-            queue_backend=self.queue_backend,
-            shutdown_timeout=self.shutdown_timeout,
-            defer_format=bool(self.defer_format),
-        )
+        with self._config_lock:
+            return LoggerConfig(
+                file_name=self.file_name,
+                log_dir=self.log_dir,
+                max_size=self.max_size,
+                retention=self.retention,
+                language=self.language,
+                custom_format=self.custom_format,
+                compression=self.compression,
+                enable_stats=bool(self.enable_stats),
+                env=self.env,
+                enqueue=bool(self.enqueue),
+                diagnose=bool(self.diagnose),
+                backtrace=bool(self.backtrace),
+                serialize=bool(self.serialize),
+                console_serialize=bool(self.console_serialize),
+                console_level=self.console_level,
+                file_level=self.file_level,
+                queue_size=self.queue_size,
+                overflow_policy=self.overflow_policy,
+                queue_timeout=self.queue_timeout,
+                process_isolation=bool(self.process_isolation),
+                queue_backend=self.queue_backend,
+                shutdown_timeout=self.shutdown_timeout,
+                defer_format=bool(self.defer_format),
+            )
 
     def reconfigure(self, **changes: Any) -> LoggerConfig:
         """Validate and atomically apply a set of configuration changes."""
@@ -490,42 +584,83 @@ class YydsLogger:
                 if name in normalized:
                     normalized[name] = bool(normalized[name])
 
+            # Validate against a candidate snapshot before mutating ``self`` so
+            # concurrent readers never observe invalid/uncommitted fields.
+            candidate = self._config_snapshot()
+            candidate.update(normalized)
+            if "process_isolation" in normalized:
+                candidate["_process_file_name"] = (
+                    f"{self.file_name}.pid{os.getpid()}"
+                    if candidate["process_isolation"] else self.file_name
+                )
+            self._validate_config_values(candidate)
+
             for name, value in normalized.items():
                 setattr(self, name, value)
             if "process_isolation" in normalized:
-                self._process_file_name = (
-                    f"{self.file_name}.pid{os.getpid()}"
-                    if self.process_isolation else self.file_name
-                )
+                self._process_file_name = candidate["_process_file_name"]
+            if "language" in normalized:
+                self._health_checker = None
+                self._health_checker_lang = None
             self._configure_logger()
+            self._sync_process_isolation_registration()
+            self._finalizer_state[1] = self.shutdown_timeout
             return self.config
 
     def _restore_config(self, snapshot: Dict[str, Any]) -> None:
         for name, value in snapshot.items():
             setattr(self, name, value)
         self._refresh_sink_level_nos()
+        self._sync_process_isolation_registration()
+        self._finalizer_state[1] = self.shutdown_timeout
+
+    def _lookup_level_no(self, name: Any) -> Optional[int]:
+        """Resolve a level name or integer to its numeric value, or None if unknown."""
+        if isinstance(name, bool):
+            return None
+        if isinstance(name, int):
+            return name if name >= 0 else None
+        cache = self._level_no_cache
+        cached = cache.get(name)
+        if cached is not None:
+            return cached
+        raw_lookup = self.logger._core.levels_lookup
+        entry = raw_lookup.get(name)
+        if entry is not None:
+            no = int(entry[2])
+            cache[name] = no
+            return no
+        if isinstance(name, str):
+            upper = name.strip().upper()
+            entry = raw_lookup.get(upper)
+            if entry is not None:
+                no = int(entry[2])
+                cache[name] = no
+                return no
+        try:
+            no = int(self.logger.level(str(name)).no)
+            cache[name] = no
+            return no
+        except Exception:
+            if isinstance(name, str):
+                upper = name.strip().upper()
+                if upper != name:
+                    try:
+                        no = int(self.logger.level(upper).no)
+                        cache[name] = no
+                        return no
+                    except Exception:
+                        pass
+            return None
 
     def _safe_level_no(self, name: Any) -> int:
         """安全获取日志级别编号，失败返回 0（最低，等于不过滤）"""
-        try:
-            if isinstance(name, int):
-                return name
-            return self.logger.level(str(name)).no
-        except Exception:
-            return 0
+        resolved = self._lookup_level_no(name)
+        return 0 if resolved is None else resolved
 
     def _level_no(self, name: Any) -> int:
         """带缓存的级别号查询，避免每条日志都走 loguru 的级别表查找（热路径优化）。"""
-        if isinstance(name, int):
-            return name
-        cache = self._level_no_cache
-        v = cache.get(name)
-        if v is not None:
-            return v
-        v = self._safe_level_no(name)
-        if v:  # 只缓存有效(非0)结果，避免缓存"级别尚未定义"的瞬态 0
-            cache[name] = v
-        return v
+        return self._safe_level_no(name)
 
     def _refresh_sink_level_nos(self) -> None:
         """Refresh derived level thresholds for every active sink."""
@@ -535,24 +670,36 @@ class YydsLogger:
         self._file_level_no = (
             0 if self.file_level is None else self._safe_level_no(self.file_level)
         )
-        self._min_level_no = min(
-            self._console_level_no,
-            self._file_level_no,
-        )
-
-    def _emits(self, level_upper: str) -> bool:
-        """Return whether any active sink emits the given level."""
-        no = self._level_no(level_upper)
-        return any(
-            no >= sink_level
-            for sink_level in (
+        core = getattr(getattr(self, "logger", None), "_core", None)
+        if core is not None and core.handlers:
+            self._min_level_no = min(
+                self._console_level_no,
+                self._file_level_no,
+                core.min_level,
+            )
+        else:
+            self._min_level_no = min(
                 self._console_level_no,
                 self._file_level_no,
             )
-        )
+
+    def _effective_min_level_no(self) -> float:
+        core = self.logger._core
+        if core.handlers:
+            return core.min_level
+        return self._min_level_no
+
+    def _emits(self, level_upper: str) -> bool:
+        """Return whether any active sink emits the given level."""
+        no = self._lookup_level_no(level_upper)
+        if no is None:
+            return False
+        return no >= self._effective_min_level_no()
 
     def is_level_enabled(self, level: str) -> bool:
         """判断指定级别是否会被任一已启用 sink 输出。"""
+        if getattr(self, "_cleanup_state", "open") != "open":
+            return False
         return self._emits(level)
 
     def _msg(self, key: str, **kwargs) -> str:
@@ -621,6 +768,14 @@ class YydsLogger:
         need_drain = bool(
             wait and any(getattr(handler, "_enqueue", False) for handler in active_handlers.values())
         )
+        need_mp_gc = bool(
+            wait
+            and any(
+                getattr(handler, "_enqueue", False)
+                and getattr(handler, "_queue_backend", None) == "multiprocessing"
+                for handler in active_handlers.values()
+            )
+        )
 
         if need_drain:
             # 在 remove 之前调用 complete()，等待所有 enqueue 队列排空
@@ -657,7 +812,7 @@ class YydsLogger:
                     first_error = exc
                 continue
 
-        if need_drain:
+        if need_mp_gc:
             # 强制垃圾回收，确保 multiprocessing.SimpleQueue 及其底层信号灯被释放
             import gc
             gc.collect()
@@ -773,25 +928,66 @@ class YydsLogger:
             self._validate_config()
             self._ensure_log_directory()
 
+            # Detect whether the new file sink targets the exact same file path
+            # currently owned by an active managed file handler.  If so, defer
+            # opening the new file descriptor until the old FileSink is drained
+            # and closed to avoid dual-fd rotation loss and scrambled lines.
+            new_file_path = os.path.abspath(
+                os.path.join(self.log_dir, f"{self._process_file_name}.log")
+            )
+            current_handlers = getattr(self.logger._core, "handlers", {})
+            same_file_path = False
+            if has_previous_config:
+                for old_id in old_handler_ids:
+                    old_handler = current_handlers.get(old_id)
+                    sink = getattr(old_handler, "_sink", None)
+                    sink_path = getattr(sink, "_path", None)
+                    if sink_path is not None and os.path.abspath(sink_path) == new_file_path:
+                        same_file_path = True
+                        break
+            if same_file_path and os.path.exists(new_file_path) and not os.access(new_file_path, os.W_OK):
+                raise PermissionError(self._msg("ERR_DIR_NOT_WRITABLE", dir=new_file_path))
+
             # Recompute effective levels before building the isolated handler
             # set.  The current core remains untouched while files are opened
             # and formats are compiled.
             self._refresh_sink_level_nos()
             log_format = self._get_log_format()
 
-            staged_logger, new_handler_ids, staged_handlers = self._build_staged_handlers(log_format)
-            old_handlers = self._swap_managed_handlers(old_handler_ids, new_handler_ids, staged_handlers)
-            committed = True
-            self._handler_ids = list(new_handler_ids)
+            staged_logger, new_handler_ids, staged_handlers = self._build_staged_handlers(
+                log_format,
+                file_delay=same_file_path,
+            )
+            file_handler = staged_handlers[new_handler_ids[-1]]
+            cutover_lock = None
+            if same_file_path:
+                cutover_lock = (
+                    file_handler._queue_lock if file_handler._enqueue else file_handler._lock
+                )
 
-            # 重新缓存 opt(depth=1)，确保使用最新的 logger 配置
-            self._logger_d1 = self.logger.opt(depth=1)
-            self._last_good_config = self._config_snapshot()
-            # The cutover is already committed.  Retire old handlers after
-            # the swap; a slow/custom sink is kept in the retry list without
-            # exposing both generations to new records.
-            if old_handlers:
-                self._retire_detached_handlers(old_handlers, wait=True, strict=False)
+            old_handlers = {}
+            if cutover_lock is not None:
+                cutover_lock.acquire()
+            try:
+                old_handlers = self._swap_managed_handlers(
+                    old_handler_ids, new_handler_ids, staged_handlers
+                )
+                committed = True
+                self._handler_ids = list(new_handler_ids)
+
+                # 重新缓存 opt(depth=1/2)，确保使用最新的 logger 配置
+                self._logger_d1 = self.logger.opt(depth=1)
+                self._logger_d2 = self.logger.opt(depth=2)
+                self._refresh_sink_level_nos()
+                self._last_good_config = self._config_snapshot()
+                # Retire old handlers before releasing ``cutover_lock`` so the
+                # old FileSink finishes draining and closes the file before the
+                # delayed new FileSink opens and writes to the same path.
+                if old_handlers:
+                    self._retire_detached_handlers(old_handlers, wait=True, strict=False)
+            finally:
+                if cutover_lock is not None:
+                    cutover_lock.release()
             return
         except Exception as e:
             if committed:
@@ -807,6 +1003,7 @@ class YydsLogger:
                 self._restore_config(old_config)
                 self._handler_ids = old_handler_ids
                 self._logger_d1 = self.logger.opt(depth=1)
+                self._logger_d2 = self.logger.opt(depth=2)
                 raise
             if isinstance(e, (ValueError, TypeError)):
                 raise
@@ -815,7 +1012,7 @@ class YydsLogger:
             self._fallback_configuration()
             raise RuntimeError(self._msg('ERR_CONFIG_FAILED', error=str(e))) from e
 
-    def _build_staged_handlers(self, log_format: str):
+    def _build_staged_handlers(self, log_format: str, *, file_delay: bool = False):
         """Build managed handlers on an isolated core and reserve unique IDs."""
         staged_logger = create_logger(stderr=False, register_atexit=False)
         current_core = self.logger._core
@@ -834,7 +1031,9 @@ class YydsLogger:
         handler_ids = []
         try:
             handler_ids.append(self._add_console_handler(log_format, target_logger=staged_logger))
-            handler_ids.append(self._add_file_handler(log_format, target_logger=staged_logger))
+            handler_ids.append(
+                self._add_file_handler(log_format, target_logger=staged_logger, delay=file_delay)
+            )
         except Exception:
             for handler_id in list(handler_ids):
                 try:
@@ -916,60 +1115,76 @@ class YydsLogger:
     
     def _validate_config(self) -> None:
         """验证配置参数"""
-        if isinstance(self.max_size, bool) or not isinstance(self.max_size, int) or self.max_size <= 0:
-            raise ValueError(self._msg('ERR_MAX_SIZE'))
-        
-        if not isinstance(self.retention, str) or not self.retention.strip():
-            raise ValueError(self._msg('ERR_RETENTION'))
-        
-        if self.language not in ('zh', 'en'):
-            raise ValueError(self._msg('ERR_LANGUAGE'))
-        
-        if self.compression is not None and self.compression not in ('zip', 'gz', 'tar'):
-            raise ValueError(self._msg('ERR_COMPRESSION'))
+        self._validate_config_values(self._config_snapshot())
 
-        if self.queue_backend not in {"multiprocessing", "thread"}:
-            raise ValueError(self._msg("ERR_QUEUE_BACKEND"))
+    def _validate_config_values(self, values: Dict[str, Any]) -> None:
+        """Validate a candidate configuration mapping without mutating ``self``."""
+        lang = str(values.get("language", self.language)).strip().lower()
+        max_size = values["max_size"]
+        retention = values["retention"]
+        compression = values["compression"]
+        queue_backend = values["queue_backend"]
+        queue_size = values["queue_size"]
+        overflow_policy = values["overflow_policy"]
+        queue_timeout = values["queue_timeout"]
+        shutdown_timeout = values["shutdown_timeout"]
+        defer_format = values["defer_format"]
+        enqueue = values["enqueue"]
 
-        if self.queue_size is not None and (
-            isinstance(self.queue_size, bool)
-            or not isinstance(self.queue_size, int)
-            or self.queue_size <= 0
-        ):
-            raise TypeError(self._msg("ERR_QUEUE_SIZE"))
-        if self.overflow_policy not in {"block", "drop"}:
-            raise ValueError(self._msg("ERR_OVERFLOW_POLICY"))
-        if self.queue_timeout is not None and (
-            isinstance(self.queue_timeout, bool)
-            or not isinstance(self.queue_timeout, (int, float))
-            or self.queue_timeout < 0
-            or not math.isfinite(self.queue_timeout)
-        ):
-            raise ValueError(self._msg("ERR_QUEUE_TIMEOUT"))
-        if self.shutdown_timeout is not None and (
-            isinstance(self.shutdown_timeout, bool)
-            or not isinstance(self.shutdown_timeout, (int, float))
-            or self.shutdown_timeout <= 0
-            or not math.isfinite(self.shutdown_timeout)
-        ):
-            raise ValueError(self._msg("ERR_SHUTDOWN_TIMEOUT"))
+        if isinstance(max_size, bool) or not isinstance(max_size, int) or max_size <= 0:
+            raise ValueError(get_message(lang, 'ERR_MAX_SIZE'))
 
-        if self.defer_format and (not self.enqueue or self.queue_backend != "thread"):
+        if not isinstance(retention, str) or not retention.strip():
+            raise ValueError(get_message(lang, 'ERR_RETENTION'))
+
+        if lang not in ('zh', 'en'):
+            raise ValueError(get_message(lang, 'ERR_LANGUAGE'))
+
+        if compression is not None and compression not in ('zip', 'gz', 'tar'):
+            raise ValueError(get_message(lang, 'ERR_COMPRESSION'))
+
+        if queue_backend not in {"multiprocessing", "thread"}:
+            raise ValueError(get_message(lang, "ERR_QUEUE_BACKEND"))
+
+        if queue_size is not None and (
+            isinstance(queue_size, bool)
+            or not isinstance(queue_size, int)
+            or queue_size <= 0
+        ):
+            raise TypeError(get_message(lang, "ERR_QUEUE_SIZE"))
+        if overflow_policy not in {"block", "drop"}:
+            raise ValueError(get_message(lang, "ERR_OVERFLOW_POLICY"))
+        if queue_timeout is not None and (
+            isinstance(queue_timeout, bool)
+            or not isinstance(queue_timeout, (int, float))
+            or queue_timeout < 0
+            or not math.isfinite(queue_timeout)
+        ):
+            raise ValueError(get_message(lang, "ERR_QUEUE_TIMEOUT"))
+        if shutdown_timeout is not None and (
+            isinstance(shutdown_timeout, bool)
+            or not isinstance(shutdown_timeout, (int, float))
+            or shutdown_timeout <= 0
+            or not math.isfinite(shutdown_timeout)
+        ):
+            raise ValueError(get_message(lang, "ERR_SHUTDOWN_TIMEOUT"))
+
+        if defer_format and (not enqueue or queue_backend != "thread"):
             raise ValueError(
                 "defer_format requires enqueue=True and queue_backend='thread'"
             )
 
         # 校验级别名是否被 loguru 识别（自定义级别在此之前 add 的也会通过）
         for lvl_name, lvl_value in (
-            ("console_level", self.console_level),
-            ("file_level", self.file_level),
+            ("console_level", values["console_level"]),
+            ("file_level", values["file_level"]),
         ):
             if lvl_value is None:
                 continue
             try:
                 self.logger.level(str(lvl_value))
             except Exception:
-                raise ValueError(self._msg('ERR_INVALID_LEVEL', name=lvl_name, value=repr(lvl_value)))
+                raise ValueError(get_message(lang, 'ERR_INVALID_LEVEL', name=lvl_name, value=repr(lvl_value)))
 
     
     def _ensure_log_directory(self) -> None:
@@ -1014,21 +1229,23 @@ class YydsLogger:
 
         active_path = os.path.abspath(active_path)
         root, extension = os.path.splitext(active_path)
-        archive_prefix = root + "."
         archive_suffix = extension
         if self.compression:
             archive_suffix += "." + self.compression.lstrip(".")
+        archive_pattern = re.compile(
+            r"^"
+            + re.escape(root)
+            + r"\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?(?:\.\d+)?"
+            + re.escape(archive_suffix)
+            + r"$"
+        )
         expiry_seconds = duration.total_seconds()
 
         def retain_archives(logs) -> None:
             deadline = time.time() - expiry_seconds
             for log_path in logs:
                 absolute_path = os.path.abspath(log_path)
-                if (
-                    absolute_path == active_path
-                    or not absolute_path.startswith(archive_prefix)
-                    or not absolute_path.endswith(archive_suffix)
-                ):
+                if absolute_path == active_path or not archive_pattern.match(absolute_path):
                     continue
                 try:
                     if os.path.getmtime(absolute_path) <= deadline:
@@ -1062,7 +1279,13 @@ class YydsLogger:
         )
         return handler_id
     
-    def _add_file_handler(self, log_format: str, target_logger=None) -> int:
+    def _add_file_handler(
+        self,
+        log_format: str,
+        target_logger=None,
+        *,
+        delay: bool = False,
+    ) -> int:
         """添加主日志文件处理器。"""
         kwargs = self._dynamic_level_kwargs(self.file_level)
         main_log_path = os.path.join(self.log_dir, f"{self._process_file_name}.log")
@@ -1074,6 +1297,7 @@ class YydsLogger:
             retention=self._archive_retention(main_log_path),
             compression=self.compression,
             encoding='utf-8',
+            delay=delay,
             enqueue=self.enqueue,
             diagnose=self.diagnose,
             backtrace=self.backtrace,
@@ -1091,6 +1315,8 @@ class YydsLogger:
     def _fallback_configuration(self) -> None:
         """配置失败时的后备方案"""
         self._remove_handlers()
+        if sys.stderr is None:
+            return
         handler_id = self.logger.add(
             sys.stderr,
             format="<red>{time:YYYY-MM-DD HH:mm:ss}</red> | <level>{level: <8}</level> | <level>{message}</level>",
@@ -1136,80 +1362,88 @@ class YydsLogger:
 
     def get_queue_status(self) -> Dict[str, Any]:
         """Return the configured queue policy and the cumulative drop count."""
-        handlers = self._queue_handlers()
-        depths = [getattr(handler, "queue_depth", None) for handler in handlers]
-        capacities = [getattr(handler, "queue_capacity", None) for handler in handlers]
-        known_depths = [depth for depth in depths if depth is not None]
-        total_depth = None if len(known_depths) != len(depths) else sum(known_depths)
-        finite_capacities = [capacity for capacity in capacities if capacity is not None]
-        total_capacity = None if len(finite_capacities) != len(capacities) else sum(finite_capacities)
-        utilization = (
-            (total_depth / total_capacity)
-            if total_depth is not None and total_capacity
-            else None
-        )
-        backends = sorted({str(getattr(handler, "_queue_backend", self.queue_backend)) for handler in handlers})
-        return {
-            "enabled": bool(handlers),
-            "size": self.queue_size,
-            "capacity": total_capacity,
-            "depth": total_depth,
-            "utilization": utilization,
-            "overflow_policy": self.overflow_policy,
-            "timeout": self.queue_timeout,
-            "backend": backends[0] if len(backends) == 1 else ("mixed" if backends else self.queue_backend),
-            "defer_format": bool(self.defer_format),
-            "shutdown_timeout": self.shutdown_timeout,
-            "dropped_messages": self.get_queue_dropped(),
-            "serialization_errors": self.get_queue_serialization_errors(),
-            "drop_reasons": self._queue_drop_reasons(),
-            "writer_alive": bool(handlers) and all(
-                bool(getattr(handler, "writer_alive", False)) for handler in handlers
-            ),
-            "sink_errors": sum(int(getattr(handler, "sink_errors", 0)) for handler in handlers),
-            "handlers": [
-                {
-                    "id": getattr(handler, "_id", None),
-                    "backend": getattr(handler, "_queue_backend", self.queue_backend),
-                    "defer_format": bool(getattr(handler, "_defer_format", False)),
-                    "depth": getattr(handler, "queue_depth", None),
-                    "capacity": getattr(handler, "queue_capacity", None),
-                    "writer_alive": bool(getattr(handler, "writer_alive", False)),
-                    "dropped_messages": int(getattr(handler, "dropped_messages", 0)),
-                    "serialization_errors": int(getattr(handler, "serialization_errors", 0)),
-                    "drop_reasons": getattr(handler, "drop_reasons", {}),
-                    "last_error": (
-                        repr(getattr(handler, "last_error", None))
-                        if getattr(handler, "last_error", None) is not None
-                        else None
-                    ),
-                }
-                for handler in handlers
-            ],
-        }
+        with self._config_lock:
+            handlers = self._queue_handlers()
+            depths = [getattr(handler, "queue_depth", None) for handler in handlers]
+            capacities = [getattr(handler, "queue_capacity", None) for handler in handlers]
+            known_depths = [depth for depth in depths if depth is not None]
+            total_depth = None if len(known_depths) != len(depths) else sum(known_depths)
+            finite_capacities = [capacity for capacity in capacities if capacity is not None]
+            total_capacity = None if len(finite_capacities) != len(capacities) else sum(finite_capacities)
+            utilization = (
+                (total_depth / total_capacity)
+                if total_depth is not None and total_capacity
+                else None
+            )
+            backends = sorted({str(getattr(handler, "_queue_backend", self.queue_backend)) for handler in handlers})
+            return {
+                "enabled": bool(handlers),
+                "size": self.queue_size,
+                "capacity": total_capacity,
+                "depth": total_depth,
+                "utilization": utilization,
+                "overflow_policy": self.overflow_policy,
+                "timeout": self.queue_timeout,
+                "backend": backends[0] if len(backends) == 1 else ("mixed" if backends else self.queue_backend),
+                "defer_format": bool(self.defer_format),
+                "shutdown_timeout": self.shutdown_timeout,
+                "dropped_messages": self.get_queue_dropped(),
+                "serialization_errors": self.get_queue_serialization_errors(),
+                "drop_reasons": self._queue_drop_reasons(),
+                "writer_alive": bool(handlers) and all(
+                    bool(getattr(handler, "writer_alive", False)) for handler in handlers
+                ),
+                "sink_errors": sum(int(getattr(handler, "sink_errors", 0)) for handler in handlers),
+                "handlers": [
+                    {
+                        "id": getattr(handler, "_id", None),
+                        "backend": getattr(handler, "_queue_backend", self.queue_backend),
+                        "defer_format": bool(getattr(handler, "_defer_format", False)),
+                        "depth": getattr(handler, "queue_depth", None),
+                        "capacity": getattr(handler, "queue_capacity", None),
+                        "writer_alive": bool(getattr(handler, "writer_alive", False)),
+                        "dropped_messages": int(getattr(handler, "dropped_messages", 0)),
+                        "serialization_errors": int(getattr(handler, "serialization_errors", 0)),
+                        "drop_reasons": getattr(handler, "drop_reasons", {}),
+                        "last_error": (
+                            repr(getattr(handler, "last_error", None))
+                            if getattr(handler, "last_error", None) is not None
+                            else None
+                        ),
+                    }
+                    for handler in handlers
+                ],
+            }
 
     def get_health(self) -> Dict[str, Any]:
         """Return local log-storage health together with this logger's state."""
         from .health import LogHealthChecker
 
-        result = LogHealthChecker(language=self.language).check_health(self.log_dir)
-        queue_status = self.get_queue_status()
-        result["logger"] = {
-            "state": self._cleanup_state,
-            "enqueue": bool(self.enqueue),
-            "queue_backend": self.queue_backend,
-            "defer_format": bool(self.defer_format),
-            "queue_dropped": self.get_queue_dropped(),
-            "queue_serialization_errors": self.get_queue_serialization_errors(),
-            "handler_count": len(getattr(self.logger._core, "handlers", {})),
-            "queue_depth": queue_status["depth"],
-            "queue_capacity": queue_status["capacity"],
-            "queue_utilization": queue_status["utilization"],
-            "queue_writer_alive": queue_status["writer_alive"],
-            "queue_drop_reasons": queue_status["drop_reasons"],
-            "queue_sink_errors": queue_status["sink_errors"],
-            "pending_handler_stops": len(self._failed_handler_stops),
-        }
+        with self._config_lock:
+            if self._health_checker is None or self._health_checker_lang != self.language:
+                self._health_checker = LogHealthChecker(language=self.language)
+                self._health_checker_lang = self.language
+            checker = self._health_checker
+            log_dir = self.log_dir
+            queue_status = self.get_queue_status()
+            state_snapshot = {
+                "state": self._cleanup_state,
+                "enqueue": bool(self.enqueue),
+                "queue_backend": self.queue_backend,
+                "defer_format": bool(self.defer_format),
+                "queue_dropped": queue_status["dropped_messages"],
+                "queue_serialization_errors": queue_status["serialization_errors"],
+                "handler_count": len(getattr(self.logger._core, "handlers", {})),
+                "queue_depth": queue_status["depth"],
+                "queue_capacity": queue_status["capacity"],
+                "queue_utilization": queue_status["utilization"],
+                "queue_writer_alive": queue_status["writer_alive"],
+                "queue_drop_reasons": queue_status["drop_reasons"],
+                "queue_sink_errors": queue_status["sink_errors"],
+                "pending_handler_stops": len(self._failed_handler_stops),
+            }
+        result = checker.check_health(log_dir)
+        result["logger"] = state_snapshot
         return result
 
     def capture_std_logging(self, level: str = "DEBUG",
@@ -1342,21 +1576,22 @@ class YydsLogger:
     def _log_exception(self, func_name: str, error: Exception, msg_key: str,
                      level: str, trace: bool, is_async: bool):
         """统一的异常记录处理，增强错误信息显示"""
+        if getattr(self, "_cleanup_state", "open") != "open":
+            return
+        d2 = self._logger_d2
         try:
-            _logger_d2 = self.logger.opt(depth=2)
-            log_method = getattr(_logger_d2, level.lower(), _logger_d2.error)
-            
+            level_no = self._lookup_level_no(level)
             # 获取调用栈信息
-            import traceback
             tb = traceback.extract_tb(error.__traceback__)
-            
+
             # 安全地获取消息
-            error_msg = self._msg(msg_key) if msg_key in LANG_MAP[self.language] else self._msg('OCCURRENCE_EXCEPTION', error=msg_key)
-            
+            messages = LANG_MAP.get(self.language) or LANG_MAP["zh"]
+            error_msg = self._msg(msg_key) if msg_key in messages else self._msg('OCCURRENCE_EXCEPTION', error=msg_key)
+
             # 安全地格式化错误信息
             error_type = type(error).__name__
             error_value = str(error) if error is not None else "None"
-            
+
             # 获取错误发生的具体位置
             if tb:
                 # 获取最后一个调用帧(通常是错误发生的地方)
@@ -1366,7 +1601,7 @@ class YydsLogger:
             else:
                 error_location = self._msg('UNKNOWN_LOCATION')
                 line_content = self._msg('UNKNOWN_CODE_LINE')
-            
+
             # 组合详细的错误消息
             full_error_msg = (
                 f"{error_msg} [{error_type}]: {error_value} | "
@@ -1374,43 +1609,49 @@ class YydsLogger:
                 f"{self._msg('LABEL_CODE')}: {line_content}"
             )
 
+            if level_no is not None:
+                d2.log(level if level in self.logger._core.levels_lookup else level.upper(), full_error_msg)
+            else:
+                d2.error(full_error_msg)
+
             if trace:
-                # 记录详细错误消息
-                log_method(full_error_msg)
                 # 记录完整的异常堆栈
                 self.logger.opt(depth=2, exception=True).error(self._msg('FULL_EXCEPTION_STACK'))
-                
+
                 # 记录调用链信息
                 if len(tb) > 1:
-                    call_chain = []
-                    for frame in tb[-3:]:  # 只显示最后3层调用
-                        call_chain.append(f"{frame.filename}:{frame.lineno}:{frame.name}")
-                    self.logger.opt(depth=2).error(self._msg('CALL_CHAIN', chain=' -> '.join(call_chain)))
-            else:
-                log_method(full_error_msg)  # log_method already has depth=2
+                    call_chain = [
+                        f"{frame.filename}:{frame.lineno}:{frame.name}"
+                        for frame in tb[-3:]
+                    ]
+                    d2.error(self._msg('CALL_CHAIN', chain=' -> '.join(call_chain)))
 
             # 记录函数调用结束（INFO 不输出时跳过）
-            if self._info_level_no >= self._min_level_no:
+            if self._info_level_no >= self._effective_min_level_no():
                 end_msg = self._msg('END_ASYNC_FUNCTION_CALL' if is_async else 'END_FUNCTION_CALL')
-                self.logger.opt(depth=2).info(end_msg)
-            
+                d2.info(end_msg)
+
         except Exception as e:
             # 如果格式化失败，使用最基本的错误记录
-            self.logger.opt(depth=2).error(self._msg('ERROR_RECORDING_EXCEPTION', error=str(e)))
-            if trace:
-                self.logger.opt(depth=2, exception=True).error(self._msg('ORIGINAL_EXCEPTION_STACK'))
+            try:
+                d2.error(self._msg('ERROR_RECORDING_EXCEPTION', error=str(e)))
+                if trace:
+                    self.logger.opt(depth=2, exception=True).error(self._msg('ORIGINAL_EXCEPTION_STACK'))
+            except Exception:
+                pass
 
     @staticmethod
-    def _format_value(val):
+    def _format_value(val, max_len: int = 1024) -> str:
         """通用的参数/结果格式化"""
         try:
-            if isinstance(val, (str, int, float, bool)):
-                return str(val)
-            elif isinstance(val, (list, tuple)):
+            if isinstance(val, (list, tuple)):
                 return f"[{len(val)} items]"
-            elif isinstance(val, dict):
+            if isinstance(val, dict):
                 return f"{{{len(val)} items}}"
-            return str(val)
+            text = val if isinstance(val, str) else str(val)
+            if len(text) > max_len:
+                return text[: max_len - 3] + "..."
+            return text
         except Exception:
             return f"<{type(val).__name__}>"
 
@@ -1418,71 +1659,61 @@ class YydsLogger:
         """
         记录函数调用开始的公共逻辑。
         """
+        if getattr(self, "_cleanup_state", "open") != "open":
+            return
         # 级别门控：INFO 不会输出时，跳过昂贵的逐参数格式化（热路径优化）
-        if self._info_level_no < self._min_level_no:
+        if self._info_level_no < self._effective_min_level_no():
             return
         args_str = [self._format_value(arg) for arg in args]
         kwargs_str = {k: self._format_value(v) for k, v in kwargs.items()}
-        
-        if is_async:
-            self.logger.opt(depth=2).info(
-                self._msg('CALLING_ASYNC_FUNCTION', 
-                         func=func_name, 
-                         args=args_str, 
-                         kwargs=kwargs_str)
-            )
-        else:
-            self.logger.opt(depth=2).info(
-                self._msg('CALLING_FUNCTION', 
-                         func=func_name, 
-                         args=args_str, 
-                         kwargs=kwargs_str)
-            )
+
+        key = 'CALLING_ASYNC_FUNCTION' if is_async else 'CALLING_FUNCTION'
+        self._logger_d2.info(
+            self._msg(key, func=func_name, args=args_str, kwargs=kwargs_str)
+        )
 
     def _log_end(self, func_name, result, duration, is_async=False):
         """
         记录函数调用结束的公共逻辑。
         """
+        if getattr(self, "_cleanup_state", "open") != "open":
+            return
         # 级别门控：INFO 不会输出时，跳过结果格式化（热路径优化）
-        if self._info_level_no < self._min_level_no:
+        if self._info_level_no < self._effective_min_level_no():
             return
         result_str = self._format_value(result)
         duration_str = f"{duration:.6f}"
-        
-        if is_async:
-            self.logger.opt(depth=2).info(
-                self._msg('ASYNC_FUNCTION_RETURNED', 
-                         func=func_name, 
-                         result=result_str, 
-                         duration=duration_str)
-            )
-        else:
-            self.logger.opt(depth=2).info(
-                self._msg('FUNCTION_RETURNED', 
-                         func=func_name, 
-                         result=result_str, 
-                         duration=duration_str)
-            )
-            
-    def _update_stats(self, level: str) -> None:
+
+        key = 'ASYNC_FUNCTION_RETURNED' if is_async else 'FUNCTION_RETURNED'
+        self._logger_d2.info(
+            self._msg(key, func=func_name, result=result_str, duration=duration_str)
+        )
+
+    def _update_stats(self, level: str, level_no: Optional[int] = None) -> None:
         """更新轻量级日志计数。"""
         if not self.enable_stats:
             return
 
-        level_upper = level.upper()
+        if level_no is None:
+            resolved = self._lookup_level_no(level)
+            if resolved is None:
+                return
+            level_no = resolved
+
         # 级别门控：不会被任何 sink 输出的日志不计入统计
-        if not self._emits(level_upper):
+        if level_no < self._effective_min_level_no():
             return
 
+        level_upper = level.upper()
         with self._stats_lock:
             self._stats['total'] += 1
-            if level_upper in {'ERROR', 'CRITICAL'}:
+            if level_upper in {'ERROR', 'CRITICAL'} or (level_upper not in {'WARNING', 'INFO', 'SUCCESS', 'DEBUG', 'TRACE'} and level_no >= 40):
                 self._stats['error'] += 1
-            elif level_upper == 'WARNING':
+            elif level_upper == 'WARNING' or (level_upper not in {'INFO', 'SUCCESS', 'DEBUG', 'TRACE'} and 30 <= level_no < 40):
                 self._stats['warning'] += 1
-            elif level_upper in {'INFO', 'SUCCESS'}:
+            elif level_upper in {'INFO', 'SUCCESS'} or (level_upper not in {'DEBUG', 'TRACE'} and 20 <= level_no < 30):
                 self._stats['info'] += 1
-            elif level_upper in {'DEBUG', 'TRACE'}:
+            elif level_upper in {'DEBUG', 'TRACE'} or level_no < 20:
                 self._stats['debug'] += 1
 
     def get_stats(self) -> Dict[str, Any]:
@@ -1543,16 +1774,24 @@ class YydsLogger:
 
     async def _run_in_worker(self, function, *args, deadline=None):
         """Run bounded blocking shutdown work without blocking the event loop."""
-        done = threading.Event()
-        outcome = {}
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        outcome: Dict[str, Any] = {}
 
-        def run():
+        def _finish() -> None:
+            if not future.done():
+                future.set_result(None)
+
+        def run() -> None:
             try:
                 outcome["result"] = function(*args)
             except BaseException as exc:
                 outcome["error"] = exc
             finally:
-                done.set()
+                try:
+                    loop.call_soon_threadsafe(_finish)
+                except RuntimeError:
+                    pass
 
         worker = threading.Thread(
             target=run,
@@ -1560,11 +1799,17 @@ class YydsLogger:
             name="yyds-logger-shutdown",
         )
         worker.start()
-        while not done.is_set():
-            remaining = self._remaining_timeout(deadline)
-            if remaining is not None and remaining <= 0:
-                raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
-            await asyncio.sleep(0.01 if remaining is None else min(0.01, remaining))
+        remaining = self._remaining_timeout(deadline)
+        if remaining is None:
+            await future
+        elif remaining <= 0:
+            future.cancel()
+            raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
+        else:
+            try:
+                await asyncio.wait_for(future, timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED")) from exc
         worker.join(timeout=0)
         if "error" in outcome:
             raise outcome["error"]
@@ -1572,11 +1817,14 @@ class YydsLogger:
 
     async def _flush_async_internal(self, deadline: Optional[float]) -> None:
         remaining = self._remaining_timeout(deadline)
-        completer = await self._run_in_worker(
-            self.logger.complete,
-            remaining,
-            deadline=deadline,
-        )
+        if self._has_enqueued_handlers():
+            completer = await self._run_in_worker(
+                self.logger.complete,
+                remaining,
+                deadline=deadline,
+            )
+        else:
+            completer = self.logger.complete(timeout=remaining)
         remaining = self._remaining_timeout(deadline)
         if remaining is None:
             await completer
@@ -1604,6 +1852,10 @@ class YydsLogger:
         """关闭 logger 并释放资源；cleanup() 的明确别名。"""
         self.cleanup()
 
+    def _remove_all_handlers_sync(self, deadline: Optional[float]) -> None:
+        self._remove_handlers(wait=False, strict=True, deadline=deadline)
+        self._remove_remaining_handlers(strict=True, deadline=deadline)
+
     async def aclose(self) -> None:
         """Close the logger without blocking the running event loop."""
         action = self._claim_cleanup()
@@ -1617,23 +1869,19 @@ class YydsLogger:
         self._active_shutdown_deadline = deadline
         try:
             self._prepare_cleanup()
-            await self._run_in_worker(
-                self._retry_failed_handler_stops,
-                True,
-                deadline=deadline,
-            )
+            if self._failed_handler_stops:
+                await self._run_in_worker(
+                    self._retry_failed_handler_stops,
+                    True,
+                    deadline=deadline,
+                )
             await self._flush_async_internal(deadline)
-            await self._run_in_worker(
-                self._remove_handlers,
-                False,
-                True,
-                deadline=deadline,
-            )
-            await self._run_in_worker(
-                self._remove_remaining_handlers,
-                True,
-                deadline=deadline,
-            )
+            if self._handler_ids or getattr(self.logger._core, "handlers", None):
+                await self._run_in_worker(
+                    self._remove_all_handlers_sync,
+                    deadline,
+                    deadline=deadline,
+                )
         except BaseException as exc:
             self._mark_cleanup_failed(exc)
             raise
@@ -1698,12 +1946,46 @@ class YydsLogger:
             raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
         self._raise_waited_cleanup_error()
 
+    @staticmethod
+    def _wake_async_waiter(future: asyncio.Future) -> None:
+        if not future.done():
+            future.set_result(None)
+
+    def _notify_async_waiters_locked(self) -> None:
+        waiters = list(self._cleanup_async_waiters)
+        self._cleanup_async_waiters.clear()
+        for waiter_loop, waiter_future in waiters:
+            try:
+                waiter_loop.call_soon_threadsafe(self._wake_async_waiter, waiter_future)
+            except RuntimeError:
+                pass
+
     async def _wait_for_cleanup_async(self, deadline: Optional[float]) -> None:
-        while not self._cleanup_event.is_set():
-            remaining = self._remaining_timeout(deadline)
-            if remaining is not None and remaining <= 0:
-                raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
-            await asyncio.sleep(0.01 if remaining is None else min(0.01, remaining))
+        loop = asyncio.get_running_loop()
+        waiter: Optional[asyncio.Future] = None
+        with self._config_lock:
+            if not self._cleanup_event.is_set():
+                waiter = loop.create_future()
+                self._cleanup_async_waiters.append((loop, waiter))
+        if waiter is not None:
+            try:
+                remaining = self._remaining_timeout(deadline)
+                if remaining is None:
+                    await waiter
+                elif remaining <= 0:
+                    waiter.cancel()
+                    raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
+                else:
+                    try:
+                        await asyncio.wait_for(waiter, timeout=remaining)
+                    except asyncio.TimeoutError as exc:
+                        raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED")) from exc
+            finally:
+                with self._config_lock:
+                    try:
+                        self._cleanup_async_waiters.remove((loop, waiter))
+                    except ValueError:
+                        pass
         self._raise_waited_cleanup_error()
 
     def _raise_waited_cleanup_error(self) -> None:
@@ -1719,14 +2001,17 @@ class YydsLogger:
             self._cleanup_owner_thread_id = None
             self._cleanup_state = "failed"
             self._cleanup_event.set()
+            self._notify_async_waiters_locked()
 
     def _finish_cleanup(self) -> None:
-        # Only unregister after every retryable cleanup phase has succeeded.
-        # If a manual cleanup fails, atexit still gets a final chance.
-        try:
-            atexit.unregister(self.cleanup)
-        except Exception:
-            pass
+        # Only detach after every retryable cleanup phase has succeeded.
+        # If a manual cleanup fails, the finalizer still gets a final chance.
+        finalizer = getattr(self, "_finalizer", None)
+        if finalizer is not None:
+            try:
+                finalizer.detach()
+            except Exception:
+                pass
         with self._config_lock:
             self._cleaned_up = True
             self._cleanup_error = None
@@ -1734,6 +2019,7 @@ class YydsLogger:
             self._active_shutdown_deadline = None
             self._cleanup_state = "closed"
             self._cleanup_event.set()
+            self._notify_async_waiters_locked()
         try:
             logging.getLogger(__name__).info(self._msg('CLEANUP_COMPLETED'))
         except Exception:

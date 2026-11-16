@@ -36,6 +36,17 @@ def _default_datetime_formatter(dt):
     )
 
 
+def _short_datetime_formatter(dt):
+    return "%04d-%02d-%02d %02d:%02d:%02d" % (
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second,
+    )
+
+
 def _format_timezone(tzinfo, *, sep):
     offset = tzinfo.utcoffset(None).total_seconds()
     sign = "+" if offset >= 0 else "-"
@@ -53,6 +64,8 @@ def _format_timezone(tzinfo, *, sep):
 def _compile_format(spec):
     if spec == "YYYY-MM-DD HH:mm:ss.SSS":
         return _default_datetime_formatter
+    if spec == "YYYY-MM-DD HH:mm:ss":
+        return _short_datetime_formatter
 
     is_utc = spec.endswith("!UTC")
 
@@ -140,6 +153,9 @@ class datetime(datetime_):  # noqa: N801
         return _compile_format(fmt)(self)
 
 
+_TZ_CACHE = {}
+
+
 def aware_now():
     now = datetime_.now()
     timestamp = now.timestamp()
@@ -155,6 +171,19 @@ def aware_now():
         seconds = offset.total_seconds()
         zone = strftime("%Z")
 
-    tzinfo = timezone(timedelta(seconds=seconds), zone)
+    key = (seconds, zone)
+    tzinfo = _TZ_CACHE.get(key)
+    if tzinfo is None:
+        tzinfo = timezone(timedelta(seconds=seconds), zone)
+        _TZ_CACHE[key] = tzinfo
 
-    return datetime.combine(now.date(), now.time().replace(tzinfo=tzinfo))
+    return datetime(
+        now.year,
+        now.month,
+        now.day,
+        now.hour,
+        now.minute,
+        now.second,
+        now.microsecond,
+        tzinfo=tzinfo,
+    )

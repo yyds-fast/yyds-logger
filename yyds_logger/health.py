@@ -88,7 +88,8 @@ class LogHealthChecker:
                 if file_path.is_file() and (
                     file_path.name.endswith(".log") or
                     file_path.name.endswith(".log.gz") or
-                    file_path.name.endswith(".log.zip")
+                    file_path.name.endswith(".log.zip") or
+                    file_path.name.endswith(".log.tar")
                 )
             ]
         except OSError as exc:

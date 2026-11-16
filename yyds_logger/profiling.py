@@ -1,6 +1,7 @@
 """Optional line-by-line profiling used by ``YydsLogger.time_it``."""
 
 import inspect
+import re
 import sys
 import threading
 from collections import defaultdict
@@ -8,6 +9,15 @@ from time import perf_counter
 
 
 _TRACE_STATE = threading.local()
+_TAG_ESCAPE_RE = re.compile(r"(\\*)(</?(?:[fb]g\s)?[^<>\s]*>)")
+
+
+def _escape_color_tags(text: str) -> str:
+    """Escape Loguru markup tags in source code while preserving literal backslashes."""
+    return _TAG_ESCAPE_RE.sub(
+        lambda match: "\\" * (2 * len(match.group(1)) + 1) + match.group(2),
+        text,
+    )
 
 
 class ProfilingBusyError(RuntimeError):
@@ -75,35 +85,59 @@ async def _run_async(logger, func, *args, **kwargs):
 
 def _extract_stats(stats, func):
     unit = getattr(stats, "unit", 1e-6)
+    code = getattr(func, "__code__", None)
+    target_file = getattr(code, "co_filename", None)
+    target_line = getattr(code, "co_firstlineno", None)
     line_times, line_hits = {}, {}
     for key, timings in stats.timings.items():
-        if key[2].split(".")[-1] == func.__name__:
+        matched = (
+            target_file is not None
+            and key[0] == target_file
+            and key[1] == target_line
+        )
+        if not matched and target_file is None:
+            matched = key[2].split(".")[-1] == func.__name__
+        if matched:
             for line_no, hits, total_time in timings:
                 line_times[line_no] = total_time * unit
                 line_hits[line_no] = hits
     return line_times, line_hits
 
 
-def _trace_sync(func, *args, **kwargs):
-    return_value = None
+def _build_line_tracer(target_code):
     line_times = defaultdict(float)
     line_hits = defaultdict(int)
-    state = {"last_time": perf_counter(), "last_line": None}
-    target_code = func.__code__
+    frame_states = {}
 
-    def tracer(frame, event, arg):
-        if frame.f_code == target_code:
-            if event == "line":
-                now = perf_counter()
-                if state["last_line"] is not None:
-                    line_times[state["last_line"]] += now - state["last_time"]
-                state["last_line"] = frame.f_lineno
-                line_hits[frame.f_lineno] += 1
-                state["last_time"] = now
-            elif event == "return" and state["last_line"] is not None:
-                line_times[state["last_line"]] += perf_counter() - state["last_time"]
-                state["last_line"] = None
-        return tracer
+    def local_tracer(frame, event, arg):
+        if event == "line":
+            now = perf_counter()
+            state = frame_states.get(frame)
+            if state is not None:
+                if state[0] is not None:
+                    line_times[state[0]] += now - state[1]
+                lineno = frame.f_lineno
+                state[0] = lineno
+                state[1] = now
+                line_hits[lineno] += 1
+        elif event == "return":
+            state = frame_states.pop(frame, None)
+            if state is not None and state[0] is not None:
+                line_times[state[0]] += perf_counter() - state[1]
+        return local_tracer
+
+    def global_tracer(frame, event, arg):
+        if event == "call" and frame.f_code == target_code:
+            frame_states[frame] = [None, perf_counter()]
+            return local_tracer
+        return None
+
+    return global_tracer, line_times, line_hits
+
+
+def _trace_sync(func, *args, **kwargs):
+    return_value = None
+    tracer, line_times, line_hits = _build_line_tracer(func.__code__)
 
     _enter_trace()
     try:
@@ -120,24 +154,7 @@ def _trace_sync(func, *args, **kwargs):
 
 
 async def _trace_async(func, *args, **kwargs):
-    state = {"last_time": perf_counter(), "last_line": None}
-    line_times = defaultdict(float)
-    line_hits = defaultdict(int)
-    target_code = func.__code__
-
-    def tracer(frame, event, arg):
-        if frame.f_code == target_code:
-            if event == "line":
-                now = perf_counter()
-                if state["last_line"] is not None:
-                    line_times[state["last_line"]] += now - state["last_time"]
-                state["last_line"] = frame.f_lineno
-                line_hits[frame.f_lineno] += 1
-                state["last_time"] = now
-            elif event == "return" and state["last_line"] is not None:
-                line_times[state["last_line"]] += perf_counter() - state["last_time"]
-                state["last_line"] = None
-        return tracer
+    tracer, line_times, line_hits = _build_line_tracer(func.__code__)
 
     _enter_trace()
     try:
@@ -154,10 +171,13 @@ async def _trace_async(func, *args, **kwargs):
 
 
 def print_report(logger, func, total_duration_ms, line_times, line_hits):
+    if getattr(logger, "_cleanup_state", "open") != "open":
+        return
+    d3_logger = logger.logger.opt(depth=3)
     try:
         lines, start_line = inspect.getsourcelines(func)
     except Exception as exc:
-        logger.logger.opt(depth=3).warning(
+        d3_logger.warning(
             logger._msg("CANNOT_GET_SOURCE", func=func.__name__, error=str(exc))
         )
         return
@@ -181,7 +201,7 @@ def print_report(logger, func, total_duration_ms, line_times, line_hits):
         milliseconds = line_times.get(line_no, 0.0) * 1000.0
         percent = percentages[line_no]
         average = milliseconds / hits if hits else 0.0
-        source_text = source.rstrip("\n").replace("<", "\\<")
+        source_text = _escape_color_tags(source.rstrip("\n"))
         row = f" {line_no:>4} | {hits:>8} | {milliseconds:>11.2f} | {average:>11.2f} | {percent:>7.1f}% | {source_text}"
         if (percent >= 20.0 and hits) or (line_no == slowest_line and percent > 5.0):
             row = f"<red><b>{row}  <-- 🚨 {logger._msg('PERF_BOTTLENECK')}</b></red>"

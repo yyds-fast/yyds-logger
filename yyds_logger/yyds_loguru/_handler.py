@@ -1,3 +1,4 @@
+import collections
 import functools
 import json
 import math
@@ -12,6 +13,111 @@ from time import monotonic
 
 from ._colorizer import Colorizer
 from ._locks_machinery import create_handler_lock
+
+_FLUSH_MARKER = "__loguru_flush__"
+_PICKLED_MARKER = "__loguru_pickled__"
+
+
+class _ThreadQueue:
+    """Single-lock bounded deque queue with stop awareness and batch draining."""
+
+    def __init__(self, maxsize=0):
+        self._maxsize = maxsize
+        self._deque = collections.deque()
+        self._mutex = threading.Lock()
+        self._not_empty = threading.Condition(self._mutex)
+        self._not_full = threading.Condition(self._mutex)
+        self._stopped = False
+
+    def qsize(self):
+        with self._mutex:
+            return len(self._deque)
+
+    def put_log(self, item, block=True, timeout=None):
+        """Enqueue a log message unless the queue is already stopped."""
+        with self._mutex:
+            if self._stopped:
+                return False
+            if self._maxsize > 0:
+                if not block:
+                    if len(self._deque) >= self._maxsize:
+                        raise queue.Full
+                elif timeout is None:
+                    while len(self._deque) >= self._maxsize:
+                        if self._stopped:
+                            return False
+                        self._not_full.wait()
+                    if self._stopped:
+                        return False
+                elif timeout < 0:
+                    raise ValueError("'timeout' must be a non-negative number")
+                else:
+                    endtime = monotonic() + timeout
+                    while len(self._deque) >= self._maxsize:
+                        if self._stopped:
+                            return False
+                        remaining = endtime - monotonic()
+                        if remaining <= 0.0:
+                            raise queue.Full
+                        self._not_full.wait(remaining)
+                    if self._stopped:
+                        return False
+            self._deque.append(item)
+            if len(self._deque) == 1:
+                self._not_empty.notify()
+            return True
+
+    def put(self, item, block=True, timeout=None):
+        """Enqueue a control marker (permitted after stop)."""
+        with self._mutex:
+            if self._maxsize > 0:
+                if not block:
+                    if len(self._deque) >= self._maxsize:
+                        raise queue.Full
+                elif timeout is None:
+                    while len(self._deque) >= self._maxsize:
+                        self._not_full.wait()
+                else:
+                    endtime = monotonic() + timeout
+                    while len(self._deque) >= self._maxsize:
+                        remaining = endtime - monotonic()
+                        if remaining <= 0.0:
+                            raise queue.Full
+                        self._not_full.wait(remaining)
+            self._deque.append(item)
+            if len(self._deque) == 1:
+                self._not_empty.notify()
+
+    def put_nowait(self, item):
+        return self.put(item, block=False)
+
+    def stop(self):
+        """Reject new log messages and wake blocked producers immediately."""
+        with self._mutex:
+            self._stopped = True
+            self._not_full.notify_all()
+
+    def get(self):
+        with self._mutex:
+            while not self._deque:
+                self._not_empty.wait()
+            item = self._deque.popleft()
+            if self._maxsize > 0:
+                self._not_full.notify()
+            return item
+
+    def drain_batch(self, max_items=256):
+        """Wait for an item, then pop up to ``max_items`` under one lock."""
+        with self._mutex:
+            while not self._deque:
+                self._not_empty.wait()
+            batch = []
+            popleft = self._deque.popleft
+            while self._deque and len(batch) < max_items:
+                batch.append(popleft())
+            if self._maxsize > 0 and batch:
+                self._not_full.notify_all()
+            return batch
 
 
 def prepare_colored_format(format_, ansi_level):
@@ -163,6 +269,11 @@ class Handler:
         self._sink_stop_error = None
         self._sink_stop_lock = threading.Lock()
         self._last_error = None
+        self._flush_state_lock = threading.Lock()
+        self._flush_seq = 0
+        self._enqueue_state_lock = threading.Lock()
+        self._enqueue_drained_cond = threading.Condition(self._enqueue_state_lock)
+        self._active_enqueues = 0
 
         if self._is_formatter_dynamic:
             if self._colorize:
@@ -178,7 +289,7 @@ class Handler:
 
         if self._enqueue:
             if self._queue_backend == "thread":
-                self._queue = queue.Queue(maxsize=self._queue_size or 0)
+                self._queue = _ThreadQueue(maxsize=self._queue_size or 0)
                 self._confirmation_event = threading.Event()
                 self._confirmation_lock = threading.Lock()
             elif self._multiprocessing_context is None:
@@ -325,44 +436,70 @@ class Handler:
         return str_record
 
     def _enqueue_or_write(self, message, record):
-        serialization_error = None
-        with self._protected_lock():
-            if self._stopped:
-                return
-            if self._enqueue:
-                if self._queue_backend == "multiprocessing":
-                    try:
-                        # ``multiprocessing.Queue`` normally pickles in its
-                        # feeder thread.  Validate synchronously so failures
-                        # remain visible to callers and metrics.
-                        ForkingPickler.dumps(message)
-                    except Exception as exc:
-                        self._record_drop("serialization")
-                        self._last_error = exc
-                        serialization_error = exc
-                if serialization_error is None:
-                    try:
-                        if self._overflow_policy == "drop":
-                            self._queue.put_nowait(message)
-                        elif self._queue_timeout is None:
-                            self._queue.put(message)
-                        else:
-                            self._queue.put(message, timeout=float(self._queue_timeout))
-                    except Exception as exc:
-                        if isinstance(exc, queue.Full):
-                            self._record_drop(
-                                "overflow" if self._overflow_policy == "drop" else "block_timeout"
-                            )
-                            return
-                        self._last_error = exc
-                        raise
-            else:
+        if not self._enqueue:
+            with self._protected_lock():
+                if self._stopped:
+                    return
                 try:
                     self._sink.write(message)
                 except Exception as exc:
-                    self._sink_errors += 1
+                    with self._counter_lock:
+                        self._sink_errors += 1
                     self._last_error = exc
                     raise
+            return
+
+        if self._queue_backend == "thread":
+            try:
+                if self._overflow_policy == "drop":
+                    self._queue.put_log(message, block=False)
+                elif self._queue_timeout is None:
+                    self._queue.put_log(message)
+                else:
+                    self._queue.put_log(message, timeout=float(self._queue_timeout))
+            except queue.Full:
+                self._record_drop(
+                    "overflow" if self._overflow_policy == "drop" else "block_timeout"
+                )
+                return
+            except Exception as exc:
+                self._last_error = exc
+                raise
+            return
+
+        serialization_error = None
+        with self._enqueue_state_lock:
+            if self._stopped:
+                return
+            self._active_enqueues += 1
+        try:
+            try:
+                payload = (_PICKLED_MARKER, bytes(ForkingPickler.dumps(message)))
+            except Exception as exc:
+                self._record_drop("serialization")
+                self._last_error = exc
+                serialization_error = exc
+            if serialization_error is None:
+                try:
+                    if self._overflow_policy == "drop":
+                        self._queue.put_nowait(payload)
+                    elif self._queue_timeout is None:
+                        self._queue.put(payload)
+                    else:
+                        self._queue.put(payload, timeout=float(self._queue_timeout))
+                except Exception as exc:
+                    if isinstance(exc, queue.Full):
+                        self._record_drop(
+                            "overflow" if self._overflow_policy == "drop" else "block_timeout"
+                        )
+                        return
+                    self._last_error = exc
+                    raise
+        finally:
+            with self._enqueue_state_lock:
+                self._active_enqueues -= 1
+                if self._active_enqueues == 0 and self._stopped:
+                    self._enqueue_drained_cond.notify_all()
         if serialization_error is not None:
             if not self._error_interceptor.should_catch():
                 raise serialization_error
@@ -391,17 +528,37 @@ class Handler:
             if effective_timeout is None
             else monotonic() + max(0.0, float(effective_timeout))
         )
-        with self._protected_lock():
+        if not self._enqueue:
+            with self._protected_lock():
+                self._stopped = True
+            self._stop_sink(self._remaining(deadline))
+            return
+
+        if self._owner_process_pid != os.getpid():
+            with self._protected_lock():
+                self._stopped = True
+            return
+
+        if self._queue_backend == "thread":
             self._stopped = True
-            if self._enqueue:
-                if self._owner_process_pid != os.getpid():
-                    return
-                if not self._queue_stop_sent:
-                    self._put_control(None, timeout=self._remaining(deadline))
-                    self._queue_stop_sent = True
-                writer = self._thread
-            else:
-                writer = None
+            self._queue.stop()
+        else:
+            with self._enqueue_state_lock:
+                self._stopped = True
+                while self._active_enqueues > 0:
+                    remaining = self._remaining(deadline)
+                    if remaining is not None and remaining <= 0:
+                        raise TimeoutError(
+                            "Timed out while waiting for active enqueue producers on handler #%d"
+                            % self._id
+                        )
+                    self._enqueue_drained_cond.wait(timeout=remaining)
+
+        with self._protected_lock():
+            if not self._queue_stop_sent:
+                self._put_control(None, timeout=self._remaining(deadline))
+                self._queue_stop_sent = True
+            writer = self._thread
 
         if writer is not None:
             self._wait_thread(writer, self._remaining(deadline), "stopping")
@@ -432,10 +589,14 @@ class Handler:
                 raise TimeoutError(
                     "Timed out while controlling Loguru handler #%d" % self._id
                 )
-            self._confirmation_event.clear()
-            self._put_control(True, timeout=self._remaining(deadline))
+            with self._flush_state_lock:
+                self._flush_seq += 1
+                seq = self._flush_seq
+                self._confirmation_event.clear()
+            self._put_control((_FLUSH_MARKER, seq), timeout=self._remaining(deadline))
             confirmed = self._confirmation_event.wait(timeout=self._remaining(deadline))
-            self._confirmation_event.clear()
+            with self._flush_state_lock:
+                self._confirmation_event.clear()
             if not confirmed:
                 raise TimeoutError(
                     "Timed out while flushing Loguru handler #%d" % self._id
@@ -622,7 +783,7 @@ class Handler:
             "text": text,
             "record": {
                 "elapsed": {
-                    "repr": record["elapsed"],
+                    "repr": str(record["elapsed"]),
                     "seconds": record["elapsed"].total_seconds(),
                 },
                 "exception": exception,
@@ -640,66 +801,142 @@ class Handler:
                 "name": record["name"],
                 "process": {"id": record["process"].id, "name": record["process"].name},
                 "thread": {"id": record["thread"].id, "name": record["thread"].name},
-                "time": {"repr": record["time"], "timestamp": record["time"].timestamp()},
+                "time": {"repr": str(record["time"]), "timestamp": record["time"].timestamp()},
             },
         }
 
         return json.dumps(serializable, default=str, ensure_ascii=False) + "\n"
 
+    def _flush_pending_writes(self, lock, pending_writes):
+        if not pending_writes:
+            return
+        sink = self._sink
+        with lock:
+            if (
+                len(pending_writes) > 1
+                and hasattr(sink, "write_batch")
+                and "write" not in getattr(sink, "__dict__", ())
+            ):
+                try:
+                    sink.write_batch(pending_writes)
+                    pending_writes.clear()
+                    return
+                except Exception as exc:
+                    idx = getattr(exc, "_batch_index", None)
+                    with self._counter_lock:
+                        self._sink_errors += 1
+                    self._last_error = exc
+                    if idx is None:
+                        self._error_interceptor.print(pending_writes[0].record, exception=exc)
+                        pending_writes.clear()
+                        return
+                    self._error_interceptor.print(pending_writes[idx].record, exception=exc)
+                    remaining = pending_writes[idx + 1 :]
+                    pending_writes.clear()
+                    for msg in remaining:
+                        try:
+                            sink.write(msg)
+                        except Exception as item_exc:
+                            with self._counter_lock:
+                                self._sink_errors += 1
+                            self._last_error = item_exc
+                            self._error_interceptor.print(msg.record, exception=item_exc)
+                    return
+            for msg in pending_writes:
+                try:
+                    sink.write(msg)
+                except Exception as exc:
+                    with self._counter_lock:
+                        self._sink_errors += 1
+                    self._last_error = exc
+                    self._error_interceptor.print(msg.record, exception=exc)
+        pending_writes.clear()
+
+    def _ack_flush(self, seq=None):
+        with self._flush_state_lock:
+            if seq is None or seq >= self._flush_seq:
+                self._confirmation_event.set()
+
     def _queued_writer(self):
-        message = None
-        queue = self._queue
+        queue_obj = self._queue
+        drain_batch = getattr(queue_obj, "drain_batch", None)
 
         # We need to use a lock to protect sink during fork.
         # Particularly, writing to stderr may lead to deadlock in child process.
         lock = self._queue_lock
+        pending_writes = []
 
         while True:
             try:
-                message = queue.get()
+                batch = drain_batch() if drain_batch is not None else [queue_obj.get()]
             except Exception:
+                self._flush_pending_writes(lock, pending_writes)
                 with lock:
                     self._error_interceptor.print(None)
                 continue
 
-            if message is None:
-                break
+            for message in batch:
+                if (
+                    isinstance(message, tuple)
+                    and len(message) == 2
+                    and message[0] == _PICKLED_MARKER
+                ):
+                    try:
+                        message = ForkingPickler.loads(message[1])
+                    except Exception:
+                        self._flush_pending_writes(lock, pending_writes)
+                        with lock:
+                            self._error_interceptor.print(None)
+                        continue
 
-            if message is True:
-                self._confirmation_event.set()
-                continue
+                if message is None:
+                    self._flush_pending_writes(lock, pending_writes)
+                    return
 
-            if isinstance(message, DeferredMessage):
-                record = message.record
-                try:
-                    message = self._format_message(
-                        record,
-                        message.level_id,
-                        message.from_decorator,
-                        message.is_raw,
-                        message.colored_message,
-                    )
-                except Exception as exc:
-                    self._last_error = exc
-                    with lock:
-                        if not self._error_interceptor.should_catch():
-                            raise
-                        self._error_interceptor.print(record, exception=exc)
+                if message is True:
+                    self._flush_pending_writes(lock, pending_writes)
+                    self._ack_flush(None)
                     continue
 
-            with lock:
-                try:
-                    self._sink.write(message)
-                except Exception as exc:
-                    self._sink_errors += 1
-                    self._last_error = exc
-                    self._error_interceptor.print(message.record)
+                if (
+                    isinstance(message, tuple)
+                    and len(message) == 2
+                    and message[0] == _FLUSH_MARKER
+                ):
+                    self._flush_pending_writes(lock, pending_writes)
+                    self._ack_flush(message[1])
+                    continue
+
+                if isinstance(message, DeferredMessage):
+                    record = message.record
+                    try:
+                        message = self._format_message(
+                            record,
+                            message.level_id,
+                            message.from_decorator,
+                            message.is_raw,
+                            message.colored_message,
+                        )
+                    except Exception as exc:
+                        self._record_drop("serialization")
+                        self._last_error = exc
+                        with lock:
+                            self._error_interceptor.print(record, exception=exc)
+                        continue
+
+                pending_writes.append(message)
+
+            self._flush_pending_writes(lock, pending_writes)
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_lock"] = None
         state["_lock_acquired"] = None
         state["_counter_lock"] = None
+        state["_flush_state_lock"] = None
+        state["_enqueue_state_lock"] = None
+        state["_enqueue_drained_cond"] = None
+        state["_active_enqueues"] = 0
         state["_memoize_dynamic_format"] = None
         # These are process-local coordination primitives and cannot be
         # pickled (notably when a logger is sent through a spawn context).
@@ -724,6 +961,10 @@ class Handler:
         self._lock = create_handler_lock()
         self._lock_acquired = threading.local()
         self._counter_lock = threading.Lock()
+        self._flush_state_lock = threading.Lock()
+        self._enqueue_state_lock = threading.Lock()
+        self._enqueue_drained_cond = threading.Condition(self._enqueue_state_lock)
+        self._active_enqueues = 0
         self._queue_join_event = threading.Event()
         self._queue_join_lock = threading.Lock()
         self._sink_stop_event = threading.Event()

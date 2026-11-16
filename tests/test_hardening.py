@@ -1161,3 +1161,424 @@ def test_cleanup_preserves_application_hooks_installed_later(tmp_path):
         sys.excepthook = previous_excepthook
         threading.excepthook = previous_thread_hook
         signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def test_same_path_reconfigure_preserves_all_logs_during_rotation(tmp_path):
+    logger = YydsLogger(
+        "same-path-reconf",
+        log_dir=str(tmp_path),
+        max_size=1,
+        compression=None,
+        console_level="CRITICAL",
+        file_level="INFO",
+        queue_backend="thread",
+    )
+    try:
+        # Lower rotation limit so rotation happens while draining/reconfiguring.
+        file_handler = next(
+            h for h in logger.logger._core.handlers.values()
+            if getattr(getattr(h, "_sink", None), "_size_limit", None) is not None
+        )
+        file_handler._sink._size_limit = 500
+        for index in range(30):
+            logger.info("before-reconf-{}", index)
+        logger.reconfigure(file_level="DEBUG", max_size=1)
+        for index in range(30):
+            logger.debug("after-reconf-{}", index)
+        logger.flush()
+    finally:
+        logger.cleanup()
+
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(tmp_path.glob("same-path-reconf*.log"))
+    )
+    for index in range(30):
+        assert f"before-reconf-{index}" in combined
+        assert f"after-reconf-{index}" in combined
+
+
+@pytest.mark.skipif(
+    "fork" not in __import__("multiprocessing").get_all_start_methods(),
+    reason="PID reinitialization is specific to fork-capable platforms",
+)
+def test_reconfigure_process_isolation_updates_fork_registration(tmp_path):
+    import multiprocessing
+
+    logger = YydsLogger(
+        "reconf-iso",
+        log_dir=str(tmp_path),
+        process_isolation=False,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    try:
+        logger.reconfigure(process_isolation=True)
+        parent_pid = os.getpid()
+
+        def child_main():
+            logger.info("child-after-reconf")
+            logger.cleanup()
+
+        process = multiprocessing.get_context("fork").Process(target=child_main)
+        process.start()
+        child_pid = process.pid
+        process.join(timeout=5)
+        assert process.exitcode == 0
+
+        logger.reconfigure(process_isolation=False)
+        logger.info("parent-non-isolated")
+    finally:
+        logger.cleanup()
+
+    assert "child-after-reconf" in (tmp_path / f"reconf-iso.pid{child_pid}.log").read_text(encoding="utf-8")
+    assert not (tmp_path / f"reconf-iso.pid{parent_pid}.log").exists() or (
+        "child-after-reconf" not in (tmp_path / f"reconf-iso.pid{parent_pid}.log").read_text(encoding="utf-8")
+    )
+    assert "parent-non-isolated" in (tmp_path / "reconf-iso.log").read_text(encoding="utf-8")
+
+
+def test_reconfigure_validation_failure_does_not_mutate_config(tmp_path):
+    logger = YydsLogger("reconf-atomic", log_dir=str(tmp_path), language="zh", max_size=5)
+    try:
+        with pytest.raises(ValueError):
+            logger.reconfigure(language="en", max_size=-1)
+        cfg = logger.config
+        assert cfg.language == "zh"
+        assert cfg.max_size == 5
+    finally:
+        logger.cleanup()
+
+
+def test_flush_timeout_does_not_cause_next_flush_to_return_early(tmp_path):
+    written = []
+    release_first = threading.Event()
+    first_seen = threading.Event()
+
+    def slow_sink(message):
+        text = str(message).strip()
+        if "first" in text:
+            first_seen.set()
+            release_first.wait(timeout=2)
+        written.append(text)
+
+    logger = YydsLogger(
+        "flush-seq",
+        log_dir=str(tmp_path),
+        console_level="CRITICAL",
+        shutdown_timeout=0.05,
+        compression=None,
+    )
+    logger.add(slow_sink, enqueue=True, queue_backend="thread", shutdown_timeout=0.05, format="{message}")
+    try:
+        logger.info("first")
+        assert first_seen.wait(timeout=1)
+        logger.info("second")
+        with pytest.raises(TimeoutError):
+            logger.flush()
+        # A stale flush marker from the timed-out flush is still ahead of "third".
+        logger.info("third")
+        release_first.set()
+        logger.reconfigure(shutdown_timeout=2.0)
+        for handler in logger.logger._core.handlers.values():
+            handler._shutdown_timeout = 2.0
+        logger.flush()
+        assert any("third" in item for item in written)
+    finally:
+        release_first.set()
+        logger.cleanup()
+
+
+def test_defer_format_error_with_catch_false_preserves_writer_thread(tmp_path):
+    stderr = io.StringIO()
+    calls = {"count": 0}
+
+    def flaky_format(record):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("synthetic format error")
+        return "{message}\n"
+
+    logger = YydsLogger(
+        "defer-catch-false",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    out_file = tmp_path / "defer_custom.log"
+    handler_id = logger.add(
+        str(out_file),
+        enqueue=True,
+        queue_backend="thread",
+        defer_format=True,
+        catch=False,
+        format=flaky_format,
+    )
+    try:
+        with contextlib.redirect_stderr(stderr):
+            logger.info("bad-msg")
+            logger.info("good-msg")
+            logger.flush()
+        handler = logger.logger._core.handlers[handler_id]
+        assert handler.writer_alive is True
+        assert handler.serialization_errors == 1
+        assert "good-msg" in out_file.read_text(encoding="utf-8")
+    finally:
+        logger.cleanup()
+
+
+def test_retention_ignores_other_prefix_active_and_archive_files(tmp_path):
+    logger = YydsLogger(
+        "app",
+        log_dir=str(tmp_path),
+        retention="1 second",
+        compression=None,
+        enqueue=False,
+    )
+    active = tmp_path / "app.log"
+    own_archive = tmp_path / "app.2000-01-01_00-00-00.log"
+    other_active = tmp_path / "app.worker.log"
+    other_archive = tmp_path / "app.worker.2000-01-01_00-00-00.log"
+    try:
+        for p in (own_archive, other_active, other_archive):
+            p.write_text("data\n", encoding="utf-8")
+            os.utime(p, (time.time() - 10, time.time() - 10))
+        logger._archive_retention(str(active))(
+            [str(active), str(own_archive), str(other_active), str(other_archive)]
+        )
+        assert active.exists()
+        assert not own_archive.exists()
+        assert other_active.exists()
+        assert other_archive.exists()
+    finally:
+        logger.cleanup()
+
+
+def test_uncleaned_logger_is_gc_collected_and_stops_writer(tmp_path):
+    import gc
+    import weakref
+
+    logger = YydsLogger("gc-collect", log_dir=str(tmp_path), console_level="CRITICAL", compression=None)
+    writer_thread = next(
+        h._thread for h in logger.logger._core.handlers.values() if h._enqueue
+    )
+    logger.info("gc-flushed-message")
+    ref = weakref.ref(logger)
+    del logger
+    gc.collect()
+    assert ref() is None
+    writer_thread.join(timeout=2)
+    assert not writer_thread.is_alive()
+    assert "gc-flushed-message" in (tmp_path / "gc-collect.log").read_text(encoding="utf-8")
+
+
+def test_blocked_queue_timeout_does_not_serialize_stop(tmp_path):
+    gate = threading.Event()
+
+    def blocking_sink(message):
+        gate.wait(timeout=2)
+
+    logger = YydsLogger(
+        "stop-unblocks",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="CRITICAL",
+        shutdown_timeout=0.5,
+    )
+    logger.add(
+        blocking_sink,
+        enqueue=True,
+        queue_backend="thread",
+        queue_size=1,
+        overflow_policy="block",
+        queue_timeout=5.0,
+        shutdown_timeout=0.5,
+        format="{message}",
+    )
+    logger.info("fill-worker")
+    logger.info("fill-queue")
+
+    def blocked_producer():
+        logger.info("blocked")
+
+    threads = [threading.Thread(target=blocked_producer) for _ in range(3)]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)
+
+    started = time.monotonic()
+    gate.set()
+    logger.cleanup()
+    elapsed = time.monotonic() - started
+    for t in threads:
+        t.join(timeout=2)
+    assert elapsed < 1.5
+    assert all(not t.is_alive() for t in threads)
+
+
+def test_level_gate_respects_custom_handlers_and_case(tmp_path):
+    captured = []
+    logger = YydsLogger(
+        "custom-gate",
+        log_dir=str(tmp_path),
+        console_level="CRITICAL",
+        file_level="ERROR",
+        enable_stats=True,
+        enqueue=False,
+    )
+    try:
+        logger.add(lambda m: captured.append(str(m)), level="DEBUG", format="{message}")
+        assert logger.is_level_enabled("DEBUG") is True
+        assert logger.is_level_enabled("debug") is True
+        assert logger.is_level_enabled("NONEXISTENT") is False
+
+        @logger.time_it
+        def work():
+            return 1
+
+        work()
+        logger.debug("debug-custom")
+        stats = logger.get_stats()
+        assert stats["total"] == 2
+        assert stats["debug"] == 1
+        assert stats["info"] == 1
+        assert any("debug-custom" in item for item in captured)
+    finally:
+        logger.cleanup()
+
+
+def test_signal_handler_ignores_sig_ign_and_allows_custom_handler_logging(tmp_path):
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        logger_ign = YydsLogger("sig-ign", log_dir=str(tmp_path), enqueue=False, console_level="CRITICAL")
+        try:
+            logger_ign.setup_signal_handlers()
+            installed = signal.getsignal(signal.SIGTERM)
+            installed(signal.SIGTERM, None)
+            assert logger_ign._cleanup_state == "open"
+            logger_ign.info("still-open")
+        finally:
+            logger_ign.cleanup()
+
+        custom_logged = []
+
+        def custom_handler(signum, frame):
+            logger_custom.info("graceful-shutdown-log")
+            custom_logged.append(signum)
+
+        signal.signal(signal.SIGTERM, custom_handler)
+        logger_custom = YydsLogger("sig-custom", log_dir=str(tmp_path), enqueue=False, console_level="CRITICAL")
+        try:
+            logger_custom.setup_signal_handlers()
+            installed = signal.getsignal(signal.SIGTERM)
+            installed(signal.SIGTERM, None)
+            deadline = time.monotonic() + 2.0
+            while logger_custom._cleanup_state != "closed" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert custom_logged == [signal.SIGTERM]
+            assert logger_custom._cleanup_state == "closed"
+            assert "graceful-shutdown-log" in (tmp_path / "sig-custom.log").read_text(encoding="utf-8")
+        finally:
+            logger_custom.cleanup()
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def test_async_sink_with_enqueue_true_schedules_safely(tmp_path):
+    received = []
+
+    async def scenario():
+        logger = YydsLogger(
+            "async-enqueued",
+            log_dir=str(tmp_path),
+            enqueue=False,
+            console_level="CRITICAL",
+        )
+
+        async def sink(message):
+            await asyncio.sleep(0.005)
+            received.append(str(message).strip())
+
+        logger.add(sink, enqueue=True, queue_backend="thread", format="{message}")
+        logger.info("hello-enqueued-async")
+        await logger.flush_async()
+        await logger.aclose()
+
+    asyncio.run(scenario())
+    assert received == ["hello-enqueued-async"]
+
+
+def test_line_profiler_escapes_backslash_tags_and_supports_recursion(tmp_path):
+    logger = YydsLogger("prof-escape", log_dir=str(tmp_path), enqueue=False, console_level="CRITICAL")
+    try:
+        @logger.time_it(line_by_line=True)
+        def recursive_fn(n):
+            marker = r"\<red>"
+            if n < 1:
+                return len(marker)
+            return recursive_fn(n - 1)
+
+        assert recursive_fn(2) == len(r"\<red>")
+        content = (tmp_path / "prof-escape.log").read_text(encoding="utf-8")
+        assert "recursive_fn" in content
+    finally:
+        logger.cleanup()
+
+
+def test_stdlib_bridge_early_filter_and_shallow_stack(tmp_path):
+    class ExplodingStr:
+        def __str__(self):
+            raise AssertionError("must not format filtered stdlib record")
+
+    name = "early-filter-bridge"
+    target = logging.getLogger(name)
+    orig_handlers = list(target.handlers)
+    orig_level = target.level
+    orig_propagate = target.propagate
+    logger = YydsLogger(
+        "bridge-opt",
+        log_dir=str(tmp_path),
+        file_level="WARNING",
+        console_level="CRITICAL",
+        enqueue=False,
+    )
+    try:
+        logger.capture_std_logging(level="DEBUG", names=[name])
+        target.debug("ignored %s", ExplodingStr())
+        # Direct shallow emit call (< 6 frames)
+        intercept = logger._std_logging_state["handler"]
+        record = logging.LogRecord(name, logging.WARNING, __file__, 1, "shallow-warning", (), None)
+        intercept.emit(record)
+    finally:
+        logger.cleanup()
+        target.handlers = orig_handlers
+        target.setLevel(orig_level)
+        target.propagate = orig_propagate
+
+    content = (tmp_path / "bridge-opt.log").read_text(encoding="utf-8")
+    assert "shallow-warning" in content
+
+
+def test_health_checker_counts_tar_archives(tmp_path):
+    (tmp_path / "app.2026-01-01.log.tar").write_text("tar", encoding="utf-8")
+    result = LogHealthChecker().check_health(str(tmp_path))
+    assert result["metrics"]["log_files_count"] == 1
+
+
+def test_multiprocessing_backend_writes_and_flushes_records(tmp_path):
+    logger = YydsLogger(
+        "mp-e2e",
+        log_dir=str(tmp_path),
+        queue_backend="multiprocessing",
+        console_level="CRITICAL",
+        compression=None,
+    )
+    try:
+        logger.bind(user="alice").info("mp-ok-{}", 42)
+        logger.flush()
+    finally:
+        logger.cleanup()
+    content = (tmp_path / "mp-e2e.log").read_text(encoding="utf-8")
+    assert "mp-ok-42" in content

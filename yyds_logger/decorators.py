@@ -75,6 +75,13 @@ def time_it(logger, func=None, *, line_by_line=False):
 
 
 def _log_duration(logger, function_name, duration_ms):
-    if logger._info_level_no >= logger._min_level_no:
-        message = logger._msg("TIMER_SUMMARY", func=function_name, duration=f"{duration_ms:.2f}")
-        logger.logger.opt(depth=2).info(message)
+    if getattr(logger, "_cleanup_state", "open") != "open":
+        return
+    core = logger.logger._core
+    if not core.handlers or logger._info_level_no < core.min_level:
+        return
+    message = logger._msg("TIMER_SUMMARY", func=function_name, duration=f"{duration_ms:.2f}")
+    target_logger = getattr(logger, "_logger_d2", None)
+    if target_logger is None:
+        target_logger = logger.logger.opt(depth=2)
+    target_logger.info(message)

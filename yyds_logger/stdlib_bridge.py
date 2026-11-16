@@ -23,27 +23,40 @@ def capture_std_logging(logger, level: str = "DEBUG",
         if not isinstance(names, (list, tuple)) or not all(isinstance(name, str) for name in names):
             raise TypeError(get_message(logger.language, "ERR_STD_NAMES"))
     log_module = logging
+    log_file = log_module.__file__
+    get_frame = getattr(sys, "_getframe", None)
     logger_ref = weakref.ref(logger)
 
     class _InterceptHandler(log_module.Handler):
         def emit(self, record: "logging.LogRecord") -> None:
             owner = logger_ref()
-            if owner is None:
+            if owner is None or getattr(owner, "_cleanup_state", "open") != "open":
                 return
             bound_logger = owner.logger
-            try:
-                level_name = bound_logger.level(record.levelname).name
-            except (ValueError, AttributeError):
+            core = bound_logger._core
+            if not core.handlers:
+                return
+            level_entry = core.levels_lookup.get(record.levelname)
+            if level_entry is not None:
+                level_name = level_entry[1]
+                level_no = level_entry[2]
+            else:
                 level_name = record.levelno
-            try:
-                frame = sys._getframe(6)
-                depth = 6
-                while frame and frame.f_code.co_filename == log_module.__file__:
-                    frame = frame.f_back
-                    depth += 1
-            except (ValueError, AttributeError):
+                level_no = record.levelno
+            if level_no < core.min_level:
+                return
+            if get_frame is not None:
+                try:
+                    frame = get_frame(1)
+                    depth = 1
+                    while frame is not None and frame.f_code.co_filename == log_file:
+                        frame = frame.f_back
+                        depth += 1
+                except ValueError:
+                    depth = 0
+            else:
                 frame, depth = inspect.currentframe(), 0
-                while frame and (depth == 0 or frame.f_code.co_filename == log_module.__file__):
+                while frame and (depth == 0 or frame.f_code.co_filename == log_file):
                     frame = frame.f_back
                     depth += 1
             bound_logger.opt(depth=depth, exception=record.exc_info).log(

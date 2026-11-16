@@ -1,5 +1,6 @@
 import inspect
 import logging
+import threading
 import weakref
 
 from ._asyncio_loop import get_running_loop, get_task_loop
@@ -65,12 +66,7 @@ class AsyncSink:
         self._error_interceptor = error_interceptor
         self._tasks = weakref.WeakSet()
 
-    def write(self, message):
-        try:
-            loop = self._loop or get_running_loop()
-        except RuntimeError:
-            return
-
+    def _schedule_task(self, loop, message):
         coroutine = self._function(message)
         task = loop.create_task(coroutine)
 
@@ -83,6 +79,41 @@ class AsyncSink:
 
         task.add_done_callback(check_exception)
         self._tasks.add(task)
+        return task
+
+    def write(self, message):
+        try:
+            loop = self._loop or get_running_loop()
+        except RuntimeError:
+            return
+
+        try:
+            running_loop = get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is loop:
+            self._schedule_task(loop, message)
+            return
+
+        if loop.is_closed():
+            return
+
+        done = threading.Event()
+
+        def schedule_on_loop():
+            try:
+                if not loop.is_closed():
+                    self._schedule_task(loop, message)
+            finally:
+                done.set()
+
+        try:
+            loop.call_soon_threadsafe(schedule_on_loop)
+        except RuntimeError:
+            return
+        if loop.is_running():
+            done.wait(timeout=1.0)
 
     def stop(self):
         for task in self._tasks:

@@ -19,6 +19,14 @@ _FILE_LOCKS = weakref.WeakValueDictionary()
 _FILE_LOCKS_GUARD = threading.Lock()
 
 
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_FILE_LOCKS_GUARD.acquire,
+        after_in_parent=_FILE_LOCKS_GUARD.release,
+        after_in_child=_FILE_LOCKS_GUARD.release,
+    )
+
+
 def _get_file_lock(path):
     """Return a process-local lock shared by sinks targeting the same path."""
     key = os.path.abspath(str(path))
@@ -197,8 +205,16 @@ class FileSink:
         self._retention_function = self._make_retention_function(retention)
         self._compression_function = self._make_compression_function(compression)
 
+        self._fast_rotation_fn = None
+        self._size_limit = None
+        if getattr(self._rotation_function, "func", None) is Rotation.rotation_size:
+            self._fast_rotation_fn = self._rotation_function
+            self._size_limit = self._rotation_function.keywords.get("size_limit")
+        self._is_utf8 = str(self.encoding).lower().replace("_", "-") in {"utf8", "utf-8"}
+
         self._file = None
         self._file_path = None
+        self._file_size = 0
 
         self._watch = watch
         self._file_dev = -1
@@ -210,7 +226,50 @@ class FileSink:
                 self._create_dirs(path)
                 self._create_file(path)
 
+    def _message_byte_len(self, message):
+        if self._is_utf8 and message.isascii():
+            return len(message)
+        return len(message.encode(self.encoding, errors="replace"))
+
+    def _should_rotate_size(self, msg_bytes):
+        return self._file_size > 0 and (self._file_size + msg_bytes > self._size_limit)
+
+    def _write_one_unlocked(self, message):
+        if self._file is None:
+            path = self._create_path()
+            self._create_dirs(path)
+            self._create_file(path)
+
+        if self._watch:
+            self._reopen_if_needed()
+
+        if (
+            self._size_limit is not None
+            and not self._watch
+            and self._rotation_function is self._fast_rotation_fn
+        ):
+            msg_bytes = self._message_byte_len(message)
+            if self._should_rotate_size(msg_bytes):
+                self._terminate_file(is_rotating=True)
+            self._file.write(message)
+            self._file_size += msg_bytes
+            return
+
+        if self._rotation_function is not None and self._rotation_function(message, self._file):
+            self._terminate_file(is_rotating=True)
+
+        self._file.write(message)
+        if self._size_limit is not None:
+            self._file_size += self._message_byte_len(message)
+
     def write(self, message):
+        with self._lock:
+            self._write_one_unlocked(message)
+
+    def write_batch(self, messages):
+        """Write multiple formatted messages under one file lock."""
+        if not messages:
+            return
         with self._lock:
             if self._file is None:
                 path = self._create_path()
@@ -220,10 +279,38 @@ class FileSink:
             if self._watch:
                 self._reopen_if_needed()
 
-            if self._rotation_function is not None and self._rotation_function(message, self._file):
-                self._terminate_file(is_rotating=True)
+            if self._rotation_function is None and not self._watch:
+                self._file.write("".join(messages))
+                return
 
-            self._file.write(message)
+            if (
+                self._size_limit is not None
+                and not self._watch
+                and self._rotation_function is self._fast_rotation_fn
+            ):
+                if self._is_utf8 and all(m.isascii() for m in messages):
+                    total_bytes = sum(len(m) for m in messages)
+                    if self._file_size + total_bytes <= self._size_limit:
+                        self._file.write("".join(messages))
+                        self._file_size += total_bytes
+                        return
+                else:
+                    byte_lens = [self._message_byte_len(m) for m in messages]
+                    total_bytes = sum(byte_lens)
+                    if self._file_size + total_bytes <= self._size_limit:
+                        self._file.write("".join(messages))
+                        self._file_size += total_bytes
+                        return
+
+            for idx, message in enumerate(messages):
+                try:
+                    self._write_one_unlocked(message)
+                except Exception as exc:
+                    try:
+                        exc._batch_index = idx
+                    except Exception:
+                        pass
+                    raise
 
     def stop(self):
         with self._lock:
@@ -246,6 +333,14 @@ class FileSink:
     def _create_file(self, path):
         self._file = open(path, **self._kwargs)
         self._file_path = path
+        if self._size_limit is not None:
+            try:
+                self._file_size = os.fstat(self._file.fileno()).st_size
+            except OSError:
+                self._file.seek(0, 2)
+                self._file_size = self._file.tell()
+        else:
+            self._file_size = 0
 
         if self._watch:
             fileno = self._file.fileno()
@@ -259,6 +354,7 @@ class FileSink:
 
         self._file = None
         self._file_path = None
+        self._file_size = 0
         self._file_dev = -1
         self._file_ino = -1
 

@@ -18,20 +18,35 @@ else:
 
     logger_locks = weakref.WeakSet()
     handler_locks = weakref.WeakSet()
+    _registry_lock = threading.Lock()
+    _acquired_before_fork = []
 
     def acquire_locks():
-        for lock in logger_locks:
-            lock.acquire()
+        _registry_lock.acquire()
+        acquired = []
+        try:
+            for lock in list(logger_locks):
+                lock.acquire()
+                acquired.append(lock)
 
-        for lock in handler_locks:
-            lock.acquire()
+            for lock in list(handler_locks):
+                lock.acquire()
+                acquired.append(lock)
+        except BaseException:
+            for lock in reversed(acquired):
+                lock.release()
+            _registry_lock.release()
+            raise
+        _acquired_before_fork.clear()
+        _acquired_before_fork.extend(acquired)
 
     def release_locks():
-        for lock in logger_locks:
-            lock.release()
-
-        for lock in handler_locks:
-            lock.release()
+        try:
+            for lock in reversed(_acquired_before_fork):
+                lock.release()
+        finally:
+            _acquired_before_fork.clear()
+            _registry_lock.release()
 
     os.register_at_fork(
         before=acquire_locks,
@@ -41,10 +56,12 @@ else:
 
     def create_logger_lock():
         lock = threading.Lock()
-        logger_locks.add(lock)
+        with _registry_lock:
+            logger_locks.add(lock)
         return lock
 
     def create_handler_lock():
         lock = threading.Lock()
-        handler_locks.add(lock)
+        with _registry_lock:
+            handler_locks.add(lock)
         return lock

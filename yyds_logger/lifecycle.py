@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import threading
+import traceback
 
 
 def setup_exception_handler(logger) -> None:
@@ -34,8 +35,16 @@ def setup_exception_handler(logger) -> None:
             except Exception:
                 pass
             return
+        if getattr(logger, "_cleanup_state", "open") != "open":
+            call_previous(
+                previous_excepthook,
+                sys.__excepthook__,
+                exc_type,
+                exc_value,
+                exc_traceback,
+            )
+            return
         try:
-            import traceback
             tb = traceback.extract_tb(exc_traceback)
             error_msg = logger._msg("UNHANDLED_EXCEPTION")
             exc_value_str = str(exc_value) if exc_value is not None else "None"
@@ -203,6 +212,8 @@ def setup_signal_handlers(logger) -> None:
 
     def handler(signum, frame):
         previous = logger._prev_signal_handlers.get(signum)
+        if previous == signal.SIG_IGN:
+            return
         # ``signal.signal()`` is only legal from the main thread. Restore all
         # handlers here before handing cleanup to the worker, otherwise the
         # worker's normal cleanup path could never release this resource.
@@ -223,14 +234,14 @@ def setup_signal_handlers(logger) -> None:
         logger._signal_handlers = remaining_installed
         if previous == signal.SIG_DFL and frame is not None:
             logger._signal_cleanup_default_signal = signum
-        logger._signal_cleanup_event.set()
-        if callable(previous):
-            try:
-                previous(signum, frame)
-            except Exception:
-                pass
-        elif previous == signal.SIG_IGN:
-            return
+        try:
+            if callable(previous):
+                try:
+                    previous(signum, frame)
+                except Exception:
+                    pass
+        finally:
+            logger._signal_cleanup_event.set()
         # The default action is re-issued by the worker after cleanup. This
         # keeps SIGTERM/SIGINT graceful while preserving normal termination.
 
