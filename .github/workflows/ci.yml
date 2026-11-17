@@ -9,12 +9,16 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Python 3.9 is EOL and missing for Ubuntu 26.04 (ubuntu-latest) in actions/python-versions.
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - python-version: "3.9"
+            runner: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
