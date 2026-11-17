@@ -235,7 +235,7 @@ class Handler:
             "block_timeout": 0,
             "serialization": 0,
         }
-        self._counter_lock = threading.Lock()
+        self._counter_lock = create_handler_lock()
         self._sink_errors = 0
         self._metrics_collected = False
         self._multiprocessing_context = multiprocessing_context
@@ -435,6 +435,35 @@ class Handler:
         str_record.record = record
         return str_record
 
+    def _ensure_thread_writer_current_process(self):
+        """Reinitialize the in-process thread queue and writer after os.fork()."""
+        if self._owner_process_pid == os.getpid():
+            return
+        with self._protected_lock():
+            if self._owner_process_pid == os.getpid() or self._stopped:
+                return
+            self._queue = _ThreadQueue(maxsize=self._queue_size or 0)
+            self._confirmation_event = threading.Event()
+            self._confirmation_lock = threading.Lock()
+            self._flush_state_lock = threading.Lock()
+            self._flush_seq = 0
+            self._queue_stop_sent = False
+            self._queue_close_called = False
+            self._queue_join_started = False
+            self._queue_join_event = threading.Event()
+            self._queue_join_error = None
+            self._queue_join_lock = threading.Lock()
+            self._queue_closed = False
+            self._sink_stop_started = False
+            self._sink_stop_event = threading.Event()
+            self._sink_stop_error = None
+            self._sink_stop_lock = threading.Lock()
+            self._owner_process_pid = os.getpid()
+            self._thread = Thread(
+                target=self._queued_writer, daemon=True, name="loguru-writer-%d" % self._id
+            )
+            self._thread.start()
+
     def _enqueue_or_write(self, message, record):
         if not self._enqueue:
             with self._protected_lock():
@@ -450,6 +479,8 @@ class Handler:
             return
 
         if self._queue_backend == "thread":
+            if self._owner_process_pid != os.getpid():
+                self._ensure_thread_writer_current_process()
             try:
                 if self._overflow_policy == "drop":
                     self._queue.put_log(message, block=False)
@@ -568,6 +599,8 @@ class Handler:
 
     def complete_queue(self, timeout=_DEFAULT_TIMEOUT):
         if not self._enqueue:
+            return
+        if self._queue_backend == "thread" and self._owner_process_pid != os.getpid():
             return
         effective_timeout = (
             self._shutdown_timeout if timeout is _DEFAULT_TIMEOUT else timeout
@@ -955,7 +988,7 @@ class Handler:
         if self._enqueue:
             state["_sink"] = None
             state["_thread"] = None
-            state["_owner_process"] = None
+            state["_owner_process_pid"] = None
             state["_queue_lock"] = None
         return state
 
@@ -963,7 +996,7 @@ class Handler:
         self.__dict__.update(state)
         self._lock = create_handler_lock()
         self._lock_acquired = threading.local()
-        self._counter_lock = threading.Lock()
+        self._counter_lock = create_handler_lock()
         self._flush_state_lock = threading.Lock()
         self._enqueue_state_lock = threading.Lock()
         self._enqueue_drained_cond = threading.Condition(self._enqueue_state_lock)

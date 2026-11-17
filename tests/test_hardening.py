@@ -1751,3 +1751,144 @@ def test_aclose_timeout_retry_waits_for_previous_worker_cleanly(tmp_path):
         assert logger._cleanup_state == "closed"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    "fork" not in __import__("multiprocessing").get_all_start_methods(),
+    reason="Fork queue recovery is specific to fork-capable platforms",
+)
+def test_default_thread_queue_fork_logs_and_cleans_up_without_timeout(tmp_path):
+    import multiprocessing
+
+    logger = YydsLogger(
+        "fork-default-thread",
+        log_dir=str(tmp_path),
+        process_isolation=False,
+        enqueue=True,
+        queue_backend="thread",
+        console_level="CRITICAL",
+        compression=None,
+        shutdown_timeout=0.3,
+    )
+
+    def idle_child():
+        logger.cleanup()
+
+    def active_child():
+        logger.info("from-active-child")
+        logger.flush()
+        logger.cleanup()
+
+    try:
+        logger.info("from-parent")
+        ctx = multiprocessing.get_context("fork")
+
+        p_idle = ctx.Process(target=idle_child)
+        p_idle.start()
+        p_idle.join(timeout=5)
+        assert p_idle.exitcode == 0
+
+        p_active = ctx.Process(target=active_child)
+        p_active.start()
+        p_active.join(timeout=5)
+        assert p_active.exitcode == 0
+    finally:
+        logger.cleanup()
+
+    content = (tmp_path / "fork-default-thread.log").read_text(encoding="utf-8")
+    assert "from-parent" in content
+    assert "from-active-child" in content
+
+
+def test_reset_after_fork_fallback_keeps_stderr_usable_and_child_pid(tmp_path, monkeypatch):
+    logger = YydsLogger(
+        "fork-fallback",
+        log_dir=str(tmp_path),
+        process_isolation=True,
+        enqueue=False,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    stderr_buf = io.StringIO()
+    try:
+        logger._last_good_config["_process_file_name"] = "fork-fallback.pid999999"
+
+        def fail_dir():
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(logger, "_ensure_log_directory", fail_dir)
+        with contextlib.redirect_stderr(stderr_buf):
+            logger._reset_after_fork()
+            assert logger._process_file_name == f"fork-fallback.pid{os.getpid()}"
+            assert logger._cleanup_state == "open"
+            logger.error("stderr-fallback-after-fork")
+    finally:
+        logger.cleanup()
+
+    assert "stderr-fallback-after-fork" in stderr_buf.getvalue()
+
+
+def test_retention_and_file_name_validation_reject_invalid_boundaries(tmp_path):
+    for bad_name in (".", "..", "a/b", "a\\b", "bad\x00name"):
+        with pytest.raises(ValueError):
+            YydsLogger(bad_name, log_dir=str(tmp_path), enqueue=False)
+
+    for bad_retention in ("0s", "0 days", "-7 days", "1e100 days"):
+        with pytest.raises(ValueError):
+            YydsLogger("ret-check", log_dir=str(tmp_path), retention=bad_retention, enqueue=False)
+
+
+def test_level_gating_when_all_handlers_removed_and_case_insensitive_sink_levels(tmp_path):
+    logger = YydsLogger(
+        "level-check",
+        log_dir=str(tmp_path),
+        console_level="warning",
+        file_level=logging.INFO,
+        enqueue=False,
+        compression=None,
+    )
+    try:
+        assert logger.is_level_enabled("INFO") is True
+        assert logger.is_level_enabled("DEBUG") is False
+        assert logger.is_level_enabled("LATE_CUSTOM") is False
+
+        logger.level("LATE_CUSTOM", no=25)
+        assert logger.is_level_enabled("LATE_CUSTOM") is True
+
+        logger.reconfigure(console_level="error", file_level=logging.WARNING)
+        assert logger.is_level_enabled("INFO") is False
+        assert logger.is_level_enabled("WARNING") is True
+
+        logger.remove()
+        assert logger.is_level_enabled("CRITICAL") is False
+    finally:
+        logger.cleanup()
+
+
+def test_handler_pickle_state_clears_owner_process_pid_and_sync_flush_skips_asyncio_run(
+    tmp_path, monkeypatch
+):
+    logger = YydsLogger(
+        "pickle-and-flush",
+        log_dir=str(tmp_path),
+        enqueue=True,
+        queue_backend="thread",
+        console_level="CRITICAL",
+        compression=None,
+    )
+    try:
+        file_handler = next(h for h in logger.logger._core.handlers.values() if h._enqueue)
+        state = file_handler.__getstate__()
+        assert state["_owner_process_pid"] is None
+        assert "_owner_process" not in state
+
+        def forbid_asyncio_run(*args, **kwargs):
+            raise AssertionError("asyncio.run should not be called when there are no async tasks")
+
+        monkeypatch.setattr(asyncio, "run", forbid_asyncio_run)
+        logger.info("fast-flush-record")
+        logger.flush()
+    finally:
+        logger.cleanup()
+
+    assert "fast-flush-record" in (tmp_path / "pickle-and-flush.log").read_text(encoding="utf-8")

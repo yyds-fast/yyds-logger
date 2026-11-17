@@ -88,7 +88,10 @@ def parse_duration(duration):
 
         seconds += value * unit
 
-    return datetime.timedelta(seconds=seconds)
+    try:
+        return datetime.timedelta(seconds=seconds)
+    except OverflowError as e:
+        raise ValueError("Duration value is too large: '%s'" % duration) from e
 
 
 def parse_frequency(frequency):

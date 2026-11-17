@@ -19,11 +19,16 @@ _FILE_LOCKS = weakref.WeakValueDictionary()
 _FILE_LOCKS_GUARD = threading.Lock()
 
 
+def _after_fork_child_file_locks():
+    _FILE_LOCKS.clear()
+    _FILE_LOCKS_GUARD.release()
+
+
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(
         before=_FILE_LOCKS_GUARD.acquire,
         after_in_parent=_FILE_LOCKS_GUARD.release,
-        after_in_child=_FILE_LOCKS_GUARD.release,
+        after_in_child=_after_fork_child_file_locks,
     )
 
 

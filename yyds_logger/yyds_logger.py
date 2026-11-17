@@ -12,6 +12,7 @@ import sys
 import time
 import logging
 import asyncio
+import contextlib
 import math
 import traceback
 
@@ -59,16 +60,19 @@ def _finalize_logger_resources(
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                async def _drain():
+                try:
                     rem = None if deadline is None else max(0.0, deadline - monotonic())
                     completer = raw_logger.complete(timeout=rem)
-                    if deadline is None:
-                        await completer
-                    else:
-                        await asyncio.wait_for(completer, timeout=max(0.0, deadline - monotonic()))
+                    if getattr(completer, "_tasks", None):
+                        async def _drain():
+                            if deadline is None:
+                                await completer
+                            else:
+                                await asyncio.wait_for(
+                                    completer, timeout=max(0.0, deadline - monotonic())
+                                )
 
-                try:
-                    asyncio.run(_drain())
+                        asyncio.run(_drain())
                 except Exception:
                     pass
         rem = None if deadline is None else max(0.0, deadline - monotonic())
@@ -133,13 +137,24 @@ class YydsLogger:
     _global_resource_lock = threading.RLock()
     _global_resource_owners: Dict[str, weakref.ReferenceType] = {}
     _process_isolated_instances: weakref.WeakSet = weakref.WeakSet()
+    _live_instances: weakref.WeakSet = weakref.WeakSet()
     _process_isolated_registry_lock = threading.Lock()
     _process_isolated_at_fork_registered = False
     _class_fork_locks_registered = False
+    _STANDARD_STAT_BUCKETS = {
+        "ERROR": "error",
+        "CRITICAL": "error",
+        "WARNING": "warning",
+        "INFO": "info",
+        "SUCCESS": "info",
+        "DEBUG": "debug",
+        "TRACE": "debug",
+    }
     _cleanup_owner_thread_id: Optional[int]
     _cleanup_error: Optional[BaseException]
     _active_shutdown_deadline: Optional[float]
     _signal_cleanup_error: Optional[BaseException]
+    _last_good_config: Optional[Dict[str, Any]]
     _CONFIG_FIELDS = (
         "log_dir", "max_size", "retention", "custom_format", "language", "enable_stats",
         "compression", "serialize", "console_serialize",
@@ -204,7 +219,13 @@ class YydsLogger:
         """
         if not isinstance(file_name, str) or not file_name.strip():
             raise ValueError(get_message(language, "ERR_FILE_NAME"))
-        if os.path.basename(file_name) != file_name:
+        if (
+            file_name in {".", ".."}
+            or os.path.basename(file_name) != file_name
+            or "/" in file_name
+            or "\\" in file_name
+            or "\x00" in file_name
+        ):
             raise ValueError(get_message(language, "ERR_FILE_NAME"))
         self.file_name = file_name
         self._config_lock = threading.RLock()
@@ -386,13 +407,14 @@ class YydsLogger:
             return
         cls = type(self)
         with cls._process_isolated_registry_lock:
+            cls._live_instances.add(self)
             if self.process_isolation:
                 cls._process_isolated_instances.add(self)
-                if not cls._process_isolated_at_fork_registered:
-                    os.register_at_fork(after_in_child=cls._reset_process_isolated_loggers_after_fork)
-                    cls._process_isolated_at_fork_registered = True
             else:
                 cls._process_isolated_instances.discard(self)
+            if not cls._process_isolated_at_fork_registered:
+                os.register_at_fork(after_in_child=cls._reset_process_isolated_loggers_after_fork)
+                cls._process_isolated_at_fork_registered = True
 
     def _register_process_isolated_instance(self) -> None:
         """Register one lightweight child-fork hook for PID-isolated loggers."""
@@ -400,15 +422,45 @@ class YydsLogger:
 
     @classmethod
     def _reset_process_isolated_loggers_after_fork(cls) -> None:
-        """Recreate PID-isolated engines in a forked child process.
+        """Recreate PID-isolated engines and sanitize instance locks in a forked child.
 
         This callback deliberately avoids inherited instance locks: a parent
         thread may have held one at fork time.  The embedded engine is rebuilt
         instead of attempting to stop queues whose writer threads only exist
         in the parent process.
         """
-        for instance in list(cls._process_isolated_instances):
+        isolated = set(cls._process_isolated_instances)
+        for instance in isolated:
             instance._reset_after_fork()
+        for instance in list(cls._live_instances):
+            if instance not in isolated:
+                instance._reset_locks_after_fork()
+
+    def _reset_locks_after_fork(self) -> None:
+        """Refresh process-local locks in a forked child when process_isolation is False."""
+        if getattr(self, "_cleanup_state", "open") != "open":
+            return
+        self._config_lock = threading.RLock()
+        self._stats_lock = threading.Lock()
+        self._cleanup_event = threading.Event()
+        self._cleanup_event.set()
+        self._cleanup_owner_thread_id = None
+        self._cleanup_error = None
+        self._active_shutdown_deadline = None
+        self._shutdown_worker_done = None
+        self._cleanup_async_waiters = []
+        self._signal_cleanup_event = threading.Event()
+        self._signal_cleanup_stop = threading.Event()
+        self._signal_cleanup_thread = None
+        self._signal_cleanup_default_signal = None
+        self._signal_cleanup_error = None
+        if self._signal_handlers:
+            from .lifecycle import _start_signal_cleanup_worker
+
+            try:
+                _start_signal_cleanup_worker(self)
+            except Exception as exc:
+                self._signal_cleanup_error = exc
 
     def _reset_after_fork(self) -> None:
         """Replace parent-owned sinks with fresh child-local PID sinks."""
@@ -438,6 +490,7 @@ class YydsLogger:
         }
         self._removed_default_handler = False
         self._level_no_cache = {}
+        self._last_good_config = None
         self._cleanup_event = threading.Event()
         self._cleanup_event.set()
         self._cleanup_owner_thread_id = None
@@ -482,19 +535,19 @@ class YydsLogger:
 
         try:
             self._configure_logger()
-        except Exception:
+        except Exception as exc:
             # ``_configure_logger()`` already installs its stderr fallback
             # when a runtime resource (for example the log directory) fails.
-            self._cleanup_state = "failed"
-            return
-
-        self._stats_ready = True
+            # Keep the logger open so fallback stderr logging remains usable.
+            self._cleanup_error = exc
+        finally:
+            self._stats_ready = True
 
     def _patch_record(self, record: "Record") -> None:
         """Inject request context and collect stats for every logger entry point."""
         record["extra"].setdefault("request_id", self.request_id_var.get() or "-")
         if self._stats_ready and self.enable_stats:
-            self._update_stats(record["level"].name, record["level"].no)
+            self._update_stats(record["level"].name, record["level"].no, _prechecked=True)
 
     def _claim_global_resource(self, resource: str) -> None:
         """Prevent multiple instances from silently overwriting process-wide hooks."""
@@ -689,10 +742,7 @@ class YydsLogger:
             )
 
     def _effective_min_level_no(self) -> float:
-        core = self.logger._core
-        if core.handlers:
-            return core.min_level
-        return self._min_level_no
+        return self.logger._core.min_level
 
     def _emits(self, level_upper: str) -> bool:
         """Return whether any active sink emits the given level."""
@@ -802,7 +852,7 @@ class YydsLogger:
             self._collect_handler_metrics(handler)
 
         first_error = None
-        for handler_id in handler_ids:
+        for handler_id in active_handlers:
             try:
                 remaining = self._remaining_timeout(deadline)
                 if deadline is None:
@@ -897,9 +947,12 @@ class YydsLogger:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
+            remaining = self._remaining_timeout(deadline)
+            completer = self.logger.complete(timeout=remaining)
+            if not getattr(completer, "_tasks", True):
+                return
+
             async def wait_complete():
-                remaining = self._remaining_timeout(deadline)
-                completer = self.logger.complete(timeout=remaining)
                 if remaining is None:
                     await completer
                 else:
@@ -964,16 +1017,18 @@ class YydsLogger:
                 file_delay=same_file_path,
             )
             file_handler = staged_handlers[new_handler_ids[-1]]
-            cutover_lock = None
-            if same_file_path:
-                cutover_lock = (
-                    file_handler._queue_lock if file_handler._enqueue else file_handler._lock
+            cutover_cm = (
+                (
+                    file_handler._queue_lock
+                    if file_handler._enqueue
+                    else file_handler._protected_lock()
                 )
+                if same_file_path
+                else contextlib.nullcontext()
+            )
 
             old_handlers = {}
-            if cutover_lock is not None:
-                cutover_lock.acquire()
-            try:
+            with cutover_cm:
                 old_handlers = self._swap_managed_handlers(
                     old_handler_ids, new_handler_ids, staged_handlers
                 )
@@ -985,14 +1040,16 @@ class YydsLogger:
                 self._logger_d2 = self.logger.opt(depth=2)
                 self._refresh_sink_level_nos()
                 self._last_good_config = self._config_snapshot()
-                # Retire old handlers before releasing ``cutover_lock`` so the
+                # Retire old handlers before releasing ``cutover_cm`` so the
                 # old FileSink finishes draining and closes the file before the
                 # delayed new FileSink opens and writes to the same path.
                 if old_handlers:
-                    self._retire_detached_handlers(old_handlers, wait=True, strict=False)
-            finally:
-                if cutover_lock is not None:
-                    cutover_lock.release()
+                    self._retire_detached_handlers(
+                        old_handlers,
+                        wait=True,
+                        strict=False,
+                        deadline=self._shutdown_deadline(),
+                    )
             return
         except Exception as e:
             if committed:
@@ -1142,7 +1199,8 @@ class YydsLogger:
         if not isinstance(retention, str) or not retention.strip():
             raise ValueError(get_message(lang, 'ERR_RETENTION'))
         from .yyds_loguru._string_parsers import parse_duration
-        if parse_duration(retention) is None:
+        duration = parse_duration(retention)
+        if duration is None or duration.total_seconds() <= 0:
             raise ValueError("Cannot parse retention from: '%s'" % retention)
 
         custom_format = values.get("custom_format")
@@ -1196,17 +1254,45 @@ class YydsLogger:
                 "defer_format requires enqueue=True and queue_backend='thread'"
             )
 
-        # 校验级别名是否被 loguru 识别（自定义级别在此之前 add 的也会通过）
+        # 校验级别名是否被 loguru 识别（支持大小写无关标准级别、自定义级别与非负整数级别）
         for lvl_name, lvl_value in (
             ("console_level", values["console_level"]),
             ("file_level", values["file_level"]),
         ):
             if lvl_value is None:
                 continue
+            self._resolve_sink_level(lvl_name, lvl_value, lang)
+
+    def _resolve_sink_level(self, lvl_name: str, lvl_value: Any, lang: Optional[str] = None) -> Any:
+        effective_lang = lang or self.language
+        if isinstance(lvl_value, bool):
+            raise ValueError(
+                get_message(effective_lang, "ERR_INVALID_LEVEL", name=lvl_name, value=repr(lvl_value))
+            )
+        if isinstance(lvl_value, int):
+            if lvl_value < 0:
+                raise ValueError(
+                    get_message(effective_lang, "ERR_INVALID_LEVEL", name=lvl_name, value=repr(lvl_value))
+                )
+            return lvl_value
+        if isinstance(lvl_value, str):
             try:
-                self.logger.level(str(lvl_value))
+                self.logger.level(lvl_value)
+                return lvl_value
             except Exception:
-                raise ValueError(get_message(lang, 'ERR_INVALID_LEVEL', name=lvl_name, value=repr(lvl_value)))
+                upper = lvl_value.strip().upper()
+                try:
+                    self.logger.level(upper)
+                    return upper
+                except Exception:
+                    raise ValueError(
+                        get_message(
+                            effective_lang, "ERR_INVALID_LEVEL", name=lvl_name, value=repr(lvl_value)
+                        )
+                    ) from None
+        raise ValueError(
+            get_message(effective_lang, "ERR_INVALID_LEVEL", name=lvl_name, value=repr(lvl_value))
+        )
 
     
     def _ensure_log_directory(self) -> None:
@@ -1232,9 +1318,11 @@ class YydsLogger:
             "<level>{message}</level>"
         )
     
-    def _dynamic_level_kwargs(self, static_level: Optional[str]) -> Dict[str, Any]:
+    def _dynamic_level_kwargs(self, static_level: Optional[Any]) -> Dict[str, Any]:
         """Return a sink level, using 0 when no filtering is requested."""
-        return {"level": 0 if static_level is None else static_level}
+        if static_level is None:
+            return {"level": 0}
+        return {"level": self._resolve_sink_level("level", static_level)}
 
     def _archive_retention(self, active_path: str):
         """Build retention for this sink's rotated archives only.
@@ -1246,7 +1334,7 @@ class YydsLogger:
         from .yyds_loguru._string_parsers import parse_duration
 
         duration = parse_duration(self.retention)
-        if duration is None:
+        if duration is None or duration.total_seconds() <= 0:
             raise ValueError("Cannot parse retention from: '%s'" % self.retention)
 
         active_path = os.path.abspath(active_path)
@@ -1541,6 +1629,13 @@ class YydsLogger:
         except AttributeError:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
+    def level(self, name: str, no: Any = None, color: Any = None, icon: Any = None) -> Any:
+        self._ensure_open()
+        result = self._logger_d1.level(name, no=no, color=color, icon=icon)
+        if no is not None:
+            self._level_no_cache.clear()
+        return result
+
     def log(self, level: str, message: str, *args: Any, **kwargs: Any) -> None:
         self._ensure_open()
         return self._logger_d1.log(level, message, *args, **kwargs)
@@ -1711,32 +1806,47 @@ class YydsLogger:
             self._msg(key, func=func_name, result=result_str, duration=duration_str)
         )
 
-    def _update_stats(self, level: str, level_no: Optional[int] = None) -> None:
+    def _update_stats(
+        self,
+        level: str,
+        level_no: Optional[int] = None,
+        *,
+        _prechecked: bool = False,
+    ) -> None:
         """更新轻量级日志计数。"""
         if not self.enable_stats:
             return
 
-        if level_no is None:
-            resolved = self._lookup_level_no(level)
-            if resolved is None:
+        if not _prechecked:
+            if level_no is None:
+                resolved = self._lookup_level_no(level)
+                if resolved is None:
+                    return
+                level_no = resolved
+
+            # 级别门控：不会被任何 sink 输出的日志不计入统计
+            if level_no < self._effective_min_level_no():
                 return
-            level_no = resolved
 
-        # 级别门控：不会被任何 sink 输出的日志不计入统计
-        if level_no < self._effective_min_level_no():
-            return
+        bucket = self._STANDARD_STAT_BUCKETS.get(level)
+        if bucket is None:
+            level_upper = level.upper()
+            bucket = self._STANDARD_STAT_BUCKETS.get(level_upper)
+            if bucket is None:
+                if level_no is None:
+                    level_no = self._safe_level_no(level)
+                if level_no >= 40:
+                    bucket = "error"
+                elif level_no >= 30:
+                    bucket = "warning"
+                elif level_no >= 20:
+                    bucket = "info"
+                else:
+                    bucket = "debug"
 
-        level_upper = level.upper()
         with self._stats_lock:
-            self._stats['total'] += 1
-            if level_upper in {'ERROR', 'CRITICAL'} or (level_upper not in {'WARNING', 'INFO', 'SUCCESS', 'DEBUG', 'TRACE'} and level_no >= 40):
-                self._stats['error'] += 1
-            elif level_upper == 'WARNING' or (level_upper not in {'INFO', 'SUCCESS', 'DEBUG', 'TRACE'} and 30 <= level_no < 40):
-                self._stats['warning'] += 1
-            elif level_upper in {'INFO', 'SUCCESS'} or (level_upper not in {'DEBUG', 'TRACE'} and 20 <= level_no < 30):
-                self._stats['info'] += 1
-            elif level_upper in {'DEBUG', 'TRACE'} or level_no < 20:
-                self._stats['debug'] += 1
+            self._stats["total"] += 1
+            self._stats[bucket] += 1
 
     def get_stats(self) -> Dict[str, Any]:
         """获取轻量级日志统计信息。"""

@@ -126,6 +126,12 @@ start_time = aware_now()
 context = ContextVar("loguru_context", default={})
 
 
+@functools.lru_cache(maxsize=512)
+def _get_file_and_module(co_filename):
+    file_name = basename(co_filename)
+    return file_name, splitext(file_name)[0]
+
+
 class Core:
     def __init__(self):
         levels = [
@@ -1164,6 +1170,11 @@ class Logger:
                 tasks.extend(handler.tasks_to_complete())
 
         class AwaitableCompleter:
+            _tasks = tasks
+
+            def __bool__(self):
+                return bool(tasks)
+
             def __await__(self):
                 for task in tasks:
                     yield from task.__await__()
@@ -2037,7 +2048,7 @@ class Logger:
 
         current_datetime = aware_now()
 
-        file_name = basename(co_filename)
+        file_name, module_name = _get_file_and_module(co_filename)
         thread = current_thread()
         process = current_process()
         elapsed = current_datetime - start_time
@@ -2062,7 +2073,7 @@ class Logger:
             "level": RecordLevel(level_name, level_no, level_icon),
             "line": f_lineno,
             "message": str(message),
-            "module": splitext(file_name)[0],
+            "module": module_name,
             "name": name,
             "process": RecordProcess(process.ident, process.name),
             "thread": RecordThread(thread.ident, thread.name),
