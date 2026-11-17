@@ -13,7 +13,7 @@ def log_decorator(logger, msg=None, level="ERROR", trace=True, reraise=True):
     """
     def decorator(func):
         msg_key = msg or "UNHANDLED_EXCEPTION"
-        log_level = level.upper()
+        log_level = str(level)
         if inspect.iscoroutinefunction(func):
             @wraps(func)
             async def async_wrapper(*args, **kwargs):

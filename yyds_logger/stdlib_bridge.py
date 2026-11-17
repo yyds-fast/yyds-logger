@@ -15,10 +15,21 @@ def capture_std_logging(logger, level: str = "DEBUG",
     """Install an intercept handler and save the target logger state."""
     if logger._std_logging_state is not None:
         raise RuntimeError(get_message(logger.language, "ERR_STD_CAPTURE_DUPLICATE"))
-    try:
-        level_no = logger.logger.level(str(level)).no
-    except Exception as exc:
-        raise ValueError(get_message(logger.language, "ERR_STD_LEVEL", level=repr(level))) from exc
+    if isinstance(level, bool):
+        raise ValueError(get_message(logger.language, "ERR_STD_LEVEL", level=repr(level)))
+    if isinstance(level, int):
+        if level < 0:
+            raise ValueError(get_message(logger.language, "ERR_STD_LEVEL", level=repr(level)))
+        level_no = level
+    else:
+        level_str = str(level)
+        try:
+            level_no = logger.logger.level(level_str).no
+        except Exception as exc:
+            try:
+                level_no = logger.logger.level(level_str.strip().upper()).no
+            except Exception:
+                raise ValueError(get_message(logger.language, "ERR_STD_LEVEL", level=repr(level))) from exc
     if names is not None:
         if not isinstance(names, (list, tuple)) or not all(isinstance(name, str) for name in names):
             raise TypeError(get_message(logger.language, "ERR_STD_NAMES"))
@@ -127,7 +138,7 @@ def restore_std_logging(logger) -> None:
                 ]
             if target.level == captured_level:
                 target.setLevel(level)
-            if not named or target.propagate is False:
+            if named and target.propagate is False:
                 target.propagate = propagate
         except Exception as exc:
             failed_targets.append((target, handlers, level, propagate))

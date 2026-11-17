@@ -282,6 +282,7 @@ class YydsLogger:
         self._cleanup_owner_thread_id = None
         self._cleanup_error = None
         self._active_shutdown_deadline = None
+        self._shutdown_worker_done: Optional[threading.Event] = None
         self._cleanup_async_waiters: List[Tuple[asyncio.AbstractEventLoop, asyncio.Future]] = []
         self._health_checker: Optional[Any] = None
         self._health_checker_lang: Optional[str] = None
@@ -425,7 +426,6 @@ class YydsLogger:
             "debug": 0,
         }
         self._stats_start_time = datetime.now()
-        self.request_id_var = ContextVar("request_id", default="-")
         self._process_file_name = f"{self.file_name}.pid{os.getpid()}"
         self._handler_ids = []
         self._failed_handler_stops = []
@@ -443,6 +443,7 @@ class YydsLogger:
         self._cleanup_owner_thread_id = None
         self._cleanup_error = None
         self._active_shutdown_deadline = None
+        self._shutdown_worker_done = None
         self._cleanup_async_waiters = []
         self._health_checker = None
         self._health_checker_lang = None
@@ -464,10 +465,14 @@ class YydsLogger:
                 self._signal_cleanup_error = exc
 
         # Do not remove inherited handlers: their queue writers belong to the
-        # parent process.  Replacing the whole Core is safe in the child and
-        # leaves no parent-owned queue or file descriptor in use.
-        self._raw_logger = create_logger(stderr=False, register_atexit=False)
-        self.logger = self._raw_logger.patch(self._patch_record)
+        # parent process.  Resetting the Core's handler map in place preserves
+        # custom levels and pre-fork bound/contextualized logger handles while
+        # leaving no parent-owned queue or file descriptor active in the child.
+        core = self._raw_logger._core
+        core.handlers = {}
+        core.handlers_count = 0
+        core.min_level = float("inf")
+        core.thread_locals = threading.local()
         self._logger_d1 = self.logger.opt(depth=1)
         self._logger_d2 = self.logger.opt(depth=2)
         self._finalizer_state[0] = self._raw_logger
@@ -1136,6 +1141,23 @@ class YydsLogger:
 
         if not isinstance(retention, str) or not retention.strip():
             raise ValueError(get_message(lang, 'ERR_RETENTION'))
+        from .yyds_loguru._string_parsers import parse_duration
+        if parse_duration(retention) is None:
+            raise ValueError("Cannot parse retention from: '%s'" % retention)
+
+        custom_format = values.get("custom_format")
+        if custom_format:
+            if not isinstance(custom_format, str):
+                raise TypeError(
+                    "Invalid format, it should be a string, not: '%s'" % type(custom_format).__name__
+                )
+            from .yyds_loguru._colorizer import Colorizer
+            try:
+                Colorizer.prepare_format(custom_format + "\n{exception}")
+            except ValueError as exc:
+                raise ValueError(
+                    "Invalid format, color markups could not be parsed correctly"
+                ) from exc
 
         if lang not in ('zh', 'en'):
             raise ValueError(get_message(lang, 'ERR_LANGUAGE'))
@@ -1772,10 +1794,35 @@ class YydsLogger:
             for handler in getattr(self.logger._core, "handlers", {}).values()
         )
 
+    async def _await_previous_shutdown_worker(self, deadline: Optional[float]) -> None:
+        prev_done = self._shutdown_worker_done
+        if prev_done is None or prev_done.is_set():
+            return
+        while not prev_done.is_set():
+            remaining = self._remaining_timeout(deadline)
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
+            await asyncio.sleep(0.005 if remaining is None else min(0.005, remaining))
+
+    def _wait_previous_shutdown_worker_sync(self, deadline: Optional[float]) -> None:
+        prev_done = self._shutdown_worker_done
+        if prev_done is None or prev_done.is_set():
+            return
+        remaining = self._remaining_timeout(deadline)
+        if not prev_done.wait(timeout=remaining):
+            raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
+
     async def _run_in_worker(self, function, *args, deadline=None):
         """Run bounded blocking shutdown work without blocking the event loop."""
+        await self._await_previous_shutdown_worker(deadline)
+        remaining = self._remaining_timeout(deadline)
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
+
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+        done_event = threading.Event()
+        self._shutdown_worker_done = done_event
         outcome: Dict[str, Any] = {}
 
         def _finish() -> None:
@@ -1788,6 +1835,7 @@ class YydsLogger:
             except BaseException as exc:
                 outcome["error"] = exc
             finally:
+                done_event.set()
                 try:
                     loop.call_soon_threadsafe(_finish)
                 except RuntimeError:
@@ -1799,12 +1847,8 @@ class YydsLogger:
             name="yyds-logger-shutdown",
         )
         worker.start()
-        remaining = self._remaining_timeout(deadline)
         if remaining is None:
             await future
-        elif remaining <= 0:
-            future.cancel()
-            raise TimeoutError(self._msg("ERR_SHUTDOWN_TIMEOUT_REACHED"))
         else:
             try:
                 await asyncio.wait_for(future, timeout=remaining)
@@ -1869,6 +1913,7 @@ class YydsLogger:
         self._active_shutdown_deadline = deadline
         try:
             self._prepare_cleanup()
+            await self._await_previous_shutdown_worker(deadline)
             if self._failed_handler_stops:
                 await self._run_in_worker(
                     self._retry_failed_handler_stops,
@@ -1908,6 +1953,7 @@ class YydsLogger:
         self._active_shutdown_deadline = deadline
         try:
             self._prepare_cleanup()
+            self._wait_previous_shutdown_worker_sync(deadline)
             self._retry_failed_handler_stops(strict=True)
             # wait=True drains managed queues before retiring their sinks.
             self._remove_handlers(wait=True, strict=True)

@@ -722,11 +722,13 @@ class Handler:
 
     @property
     def dropped_messages(self):
-        return self._dropped_messages
+        with self._counter_lock:
+            return self._dropped_messages
 
     @property
     def serialization_errors(self):
-        return self._serialization_errors
+        with self._counter_lock:
+            return self._serialization_errors
 
     @property
     def drop_reasons(self):
@@ -735,7 +737,8 @@ class Handler:
 
     @property
     def sink_errors(self):
-        return self._sink_errors
+        with self._counter_lock:
+            return self._sink_errors
 
     @property
     def queue_depth(self):

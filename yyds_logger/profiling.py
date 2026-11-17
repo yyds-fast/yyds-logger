@@ -1,5 +1,6 @@
 """Optional line-by-line profiling used by ``YydsLogger.time_it``."""
 
+import asyncio
 import inspect
 import re
 import sys
@@ -24,7 +25,7 @@ class ProfilingBusyError(RuntimeError):
     """Raised when another fallback tracer is active in this thread."""
 
 
-def _enter_trace(target_code=None) -> None:
+def _enter_trace(target_code=None, task=None) -> None:
     # ``sys.settrace()`` is local to the current OS thread.  A process-wide
     # lock needlessly serialized independent profilers running in different
     # threads, while still needing to reject overlapping asyncio tasks in the
@@ -33,17 +34,23 @@ def _enter_trace(target_code=None) -> None:
         raise ProfilingBusyError
     _TRACE_STATE.active = True
     _TRACE_STATE.target_code = target_code
+    _TRACE_STATE.task = task
 
 
 def _leave_trace() -> None:
     _TRACE_STATE.active = False
     _TRACE_STATE.target_code = None
+    _TRACE_STATE.task = None
 
 
 def run_sync(logger, func, *args, **kwargs):
     target_code = getattr(func, "__code__", None)
     if getattr(_TRACE_STATE, "active", False):
-        if target_code is not None and getattr(_TRACE_STATE, "target_code", None) is target_code:
+        if (
+            target_code is not None
+            and getattr(_TRACE_STATE, "task", None) is None
+            and getattr(_TRACE_STATE, "target_code", None) is target_code
+        ):
             return func(*args, **kwargs)
         raise RuntimeError(logger._msg("ERR_PROFILING_BUSY"))
 
@@ -53,7 +60,7 @@ def run_sync(logger, func, *args, **kwargs):
         LineProfiler = None
     if LineProfiler is not None:
         profiler = LineProfiler()
-        _enter_trace(target_code)
+        _enter_trace(target_code, task=None)
         try:
             start = perf_counter()
             result = profiler(func)(*args, **kwargs)
@@ -76,8 +83,13 @@ def run_async(logger, func, *args, **kwargs):
 
 async def _run_async(logger, func, *args, **kwargs):
     target_code = getattr(func, "__code__", None)
+    current_task = asyncio.current_task()
     if getattr(_TRACE_STATE, "active", False):
-        if target_code is not None and getattr(_TRACE_STATE, "target_code", None) is target_code:
+        if (
+            target_code is not None
+            and getattr(_TRACE_STATE, "task", None) is current_task
+            and getattr(_TRACE_STATE, "target_code", None) is target_code
+        ):
             return await func(*args, **kwargs)
         raise RuntimeError(logger._msg("ERR_PROFILING_BUSY"))
 
@@ -88,7 +100,7 @@ async def _run_async(logger, func, *args, **kwargs):
 
     if LineProfiler is not None:
         profiler = LineProfiler()
-        _enter_trace(target_code)
+        _enter_trace(target_code, task=current_task)
         try:
             start = perf_counter()
             result = await profiler(func)(*args, **kwargs)
@@ -98,7 +110,9 @@ async def _run_async(logger, func, *args, **kwargs):
             _leave_trace()
     else:
         try:
-            result, duration_ms, line_times, line_hits = await _trace_async(func, *args, **kwargs)
+            result, duration_ms, line_times, line_hits = await _trace_async(
+                func, *args, _current_task=current_task, **kwargs
+            )
         except ProfilingBusyError as exc:
             raise RuntimeError(logger._msg("ERR_PROFILING_BUSY")) from exc
     print_report(logger, func, duration_ms, line_times, line_hits)
@@ -175,10 +189,10 @@ def _trace_sync(func, *args, **kwargs):
     return return_value, (perf_counter() - start) * 1000.0, line_times, line_hits
 
 
-async def _trace_async(func, *args, **kwargs):
+async def _trace_async(func, *args, _current_task=None, **kwargs):
     tracer, line_times, line_hits = _build_line_tracer(func.__code__)
 
-    _enter_trace(func.__code__)
+    _enter_trace(func.__code__, task=_current_task)
     try:
         old_trace = sys.gettrace()
         sys.settrace(tracer)

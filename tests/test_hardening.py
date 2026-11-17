@@ -1583,3 +1583,171 @@ def test_multiprocessing_backend_writes_and_flushes_records(tmp_path):
         logger.cleanup()
     content = (tmp_path / "mp-e2e.log").read_text(encoding="utf-8")
     assert "mp-ok-42" in content
+
+
+def test_async_line_profiler_rejects_concurrent_sibling_tasks_and_allows_recursion(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "line_profiler", None)
+    logger = YydsLogger("async-prof", log_dir=str(tmp_path), enqueue=False, console_level="CRITICAL")
+
+    async def scenario():
+        @logger.time_it(line_by_line=True)
+        async def rec_async(n):
+            if n <= 0:
+                return 0
+            return n + await rec_async(n - 1)
+
+        assert await rec_async(2) == 3
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        @logger.time_it(line_by_line=True)
+        async def slow_coro():
+            started.set()
+            await release.wait()
+            return "ok"
+
+        t1 = asyncio.create_task(slow_coro())
+        await started.wait()
+        with pytest.raises(RuntimeError):
+            await slow_coro()
+        release.set()
+        assert await t1 == "ok"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        logger.cleanup()
+
+
+@pytest.mark.skipif(
+    "fork" not in __import__("multiprocessing").get_all_start_methods(),
+    reason="PID reinitialization is specific to fork-capable platforms",
+)
+def test_prefork_preserves_request_id_var_and_bound_logger(tmp_path):
+    import multiprocessing
+
+    logger = YydsLogger(
+        "prefork-bound",
+        log_dir=str(tmp_path),
+        process_isolation=True,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    logger.level("PREFORK", no=35)
+    bound = logger.bind(component="prebound")
+    req_var = logger.request_id_var
+    parent_pid = os.getpid()
+
+    def child_main():
+        token = req_var.set("child-req-1")
+        try:
+            bound.log("PREFORK", "from-prebound")
+        finally:
+            req_var.reset(token)
+        logger.cleanup()
+
+    try:
+        logger.info("parent-entry")
+        process = multiprocessing.get_context("fork").Process(target=child_main)
+        process.start()
+        child_pid = process.pid
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    finally:
+        logger.cleanup()
+
+    parent_text = (tmp_path / f"prefork-bound.pid{parent_pid}.log").read_text(encoding="utf-8")
+    child_text = (tmp_path / f"prefork-bound.pid{child_pid}.log").read_text(encoding="utf-8")
+    assert "from-prebound" not in parent_text
+    assert "from-prebound" in child_text
+    assert "ReqID:child-req-1" in child_text
+
+
+def test_log_decorator_preserves_mixed_case_custom_level(tmp_path):
+    logger = YydsLogger(
+        "mixed-level",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    logger.level("AuditLog", no=35)
+
+    @logger.log_decorator(level="AuditLog", trace=False, reraise=False)
+    def explode():
+        raise ValueError("audit-boom")
+
+    try:
+        assert explode() is None
+    finally:
+        logger.cleanup()
+
+    content = (tmp_path / "mixed-level.log").read_text(encoding="utf-8")
+    assert "AuditLog" in content
+    assert "audit-boom" in content
+
+
+def test_capture_std_logging_accepts_int_level(tmp_path):
+    name = "int-level-bridge"
+    target = logging.getLogger(name)
+    orig_handlers = list(target.handlers)
+    orig_level = target.level
+    orig_propagate = target.propagate
+    logger = YydsLogger("std-int", log_dir=str(tmp_path), enqueue=False, console_level="CRITICAL")
+    try:
+        logger.capture_std_logging(level=logging.WARNING, names=[name])
+        target.info("ignored-info")
+        target.warning("captured-warning")
+    finally:
+        logger.cleanup()
+        target.handlers = orig_handlers
+        target.setLevel(orig_level)
+        target.propagate = orig_propagate
+
+    content = (tmp_path / "std-int.log").read_text(encoding="utf-8")
+    assert "captured-warning" in content
+    assert "ignored-info" not in content
+
+
+def test_reconfigure_invalid_retention_or_format_keeps_attributes_untouched(tmp_path):
+    logger = YydsLogger("reconf-validate", log_dir=str(tmp_path), language="zh", enqueue=False)
+    try:
+        with pytest.raises(ValueError):
+            logger.reconfigure(language="en", retention="not-a-duration")
+        assert logger.config.language == "zh"
+
+        with pytest.raises(ValueError):
+            logger.reconfigure(language="en", custom_format="<red>unclosed")
+        assert logger.config.language == "zh"
+    finally:
+        logger.cleanup()
+
+
+def test_aclose_timeout_retry_waits_for_previous_worker_cleanly(tmp_path):
+    release = threading.Event()
+
+    class BlockingSink:
+        def write(self, message):
+            return None
+
+        def stop(self):
+            release.wait()
+
+    async def scenario():
+        logger = YydsLogger(
+            "aclose-retry",
+            log_dir=str(tmp_path),
+            enqueue=False,
+            console_level="CRITICAL",
+            shutdown_timeout=0.05,
+        )
+        logger.add(BlockingSink(), format="{message}")
+        with pytest.raises((RuntimeError, TimeoutError)):
+            await logger.aclose()
+        assert logger._cleanup_state == "failed"
+        release.set()
+        await logger.aclose()
+        assert logger._cleanup_state == "closed"
+
+    asyncio.run(scenario())
