@@ -76,31 +76,43 @@ class LogHealthChecker:
             errors.append(get_message(self.language, "HEALTH_DISK_READ_FAILED", error=exc))
 
         memory_usage_mb = None
+        if psutil is not None and (
+            self._process is None or getattr(self._process, "pid", None) != os.getpid()
+        ):
+            try:
+                self._process = psutil.Process(os.getpid())
+            except Exception:
+                self._process = None
         if self._process is not None:
             try:
                 memory_usage_mb = self._process.memory_info().rss / 1024 / 1024
             except Exception as exc:
                 warnings.append(get_message(self.language, "HEALTH_MEMORY_READ_FAILED", error=exc))
 
-        try:
-            log_files = [
-                file_path for file_path in path.iterdir()
-                if file_path.is_file() and (
-                    file_path.name.endswith(".log") or
-                    file_path.name.endswith(".log.gz") or
-                    file_path.name.endswith(".log.zip") or
-                    file_path.name.endswith(".log.tar")
-                )
-            ]
-        except OSError as exc:
-            log_files = []
-            errors.append(get_message(self.language, "HEALTH_DIR_READ_FAILED", error=exc))
+        log_files_count = 0
         total_size = 0
-        for file_path in log_files:
-            try:
-                total_size += file_path.stat().st_size
-            except OSError:
-                warnings.append(get_message(self.language, "HEALTH_FILE_SIZE_FAILED", file=file_path))
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if not (
+                        name.endswith(".log")
+                        or name.endswith(".log.gz")
+                        or name.endswith(".log.zip")
+                        or name.endswith(".log.tar")
+                    ):
+                        continue
+                    try:
+                        if not entry.is_file():
+                            continue
+                        log_files_count += 1
+                        total_size += entry.stat().st_size
+                    except OSError:
+                        warnings.append(
+                            get_message(self.language, "HEALTH_FILE_SIZE_FAILED", file=Path(entry.path))
+                        )
+        except OSError as exc:
+            errors.append(get_message(self.language, "HEALTH_DIR_READ_FAILED", error=exc))
 
         if disk_usage_percent is not None:
             if disk_usage_percent >= self.disk_critical_percent:
@@ -122,7 +134,7 @@ class LogHealthChecker:
             "metrics": {
                 "disk_usage_percent": disk_usage_percent,
                 "memory_usage_mb": memory_usage_mb,
-                "log_files_count": len(log_files),
+                "log_files_count": log_files_count,
                 "total_log_size_mb": total_size / 1024 / 1024,
             },
             "checked_at": checked_at,

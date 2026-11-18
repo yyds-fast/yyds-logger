@@ -34,15 +34,47 @@ if TYPE_CHECKING:
 
 def _finalize_logger_resources(
     logger_ref: "weakref.ReferenceType[YydsLogger]",
-    state: List[Any],
+    state: Dict[str, Any],
 ) -> None:
     """Drain and stop logger resources on GC or process exit without pinning ``self``."""
     instance = logger_ref()
     if instance is not None:
-        instance.cleanup()
+        try:
+            instance.cleanup()
+        except BaseException:
+            pass
         return
 
-    raw_logger, shutdown_timeout = state
+    try:
+        if state.get("exception_hook_state") is not None:
+            from .lifecycle import restore_exception_hook_state
+
+            restore_exception_hook_state(state.get("exception_hook_state"))
+            state["exception_hook_state"] = None
+    except BaseException:
+        pass
+
+    try:
+        if state.get("std_logging_state") is not None:
+            from .stdlib_bridge import restore_std_logging_state
+
+            state["std_logging_state"] = restore_std_logging_state(
+                state.get("std_logging_state"), strict=False
+            )
+    except BaseException:
+        pass
+
+    try:
+        if state.get("signal_state") is not None:
+            from .lifecycle import restore_signal_handler_state
+
+            restore_signal_handler_state(state.get("signal_state"), strict=False)
+            state["signal_state"] = None
+    except BaseException:
+        pass
+
+    raw_logger = state.get("raw_logger")
+    shutdown_timeout = state.get("shutdown_timeout")
     if raw_logger is None:
         return
     try:
@@ -366,7 +398,13 @@ class YydsLogger:
         self._stats_start_time = datetime.now()
         self._stats_ready = True
         # 使用 weakref.finalize 确保进程退出与 GC 时自动清理队列与句柄，同时避免 atexit 强引用泄漏
-        self._finalizer_state: List[Any] = [self._raw_logger, self.shutdown_timeout]
+        self._finalizer_state: Dict[str, Any] = {
+            "raw_logger": self._raw_logger,
+            "shutdown_timeout": self.shutdown_timeout,
+            "std_logging_state": None,
+            "exception_hook_state": None,
+            "signal_state": None,
+        }
         self._finalizer = weakref.finalize(
             self,
             _finalize_logger_resources,
@@ -449,6 +487,8 @@ class YydsLogger:
         self._active_shutdown_deadline = None
         self._shutdown_worker_done = None
         self._cleanup_async_waiters = []
+        self._health_checker = None
+        self._health_checker_lang = None
         self._signal_cleanup_event = threading.Event()
         self._signal_cleanup_stop = threading.Event()
         self._signal_cleanup_thread = None
@@ -528,8 +568,8 @@ class YydsLogger:
         core.thread_locals = threading.local()
         self._logger_d1 = self.logger.opt(depth=1)
         self._logger_d2 = self.logger.opt(depth=2)
-        self._finalizer_state[0] = self._raw_logger
-        self._finalizer_state[1] = self.shutdown_timeout
+        self._finalizer_state["raw_logger"] = self._raw_logger
+        self._finalizer_state["shutdown_timeout"] = self.shutdown_timeout
         self._info_level_no = self._safe_level_no("INFO")
         self._refresh_sink_level_nos()
 
@@ -662,7 +702,7 @@ class YydsLogger:
                 self._health_checker_lang = None
             self._configure_logger()
             self._sync_process_isolation_registration()
-            self._finalizer_state[1] = self.shutdown_timeout
+            self._finalizer_state["shutdown_timeout"] = self.shutdown_timeout
             return self.config
 
     def _restore_config(self, snapshot: Dict[str, Any]) -> None:
@@ -670,7 +710,7 @@ class YydsLogger:
             setattr(self, name, value)
         self._refresh_sink_level_nos()
         self._sync_process_isolation_registration()
-        self._finalizer_state[1] = self.shutdown_timeout
+        self._finalizer_state["shutdown_timeout"] = self.shutdown_timeout
 
     def _lookup_level_no(self, name: Any) -> Optional[int]:
         """Resolve a level name or integer to its numeric value, or None if unknown."""
@@ -1345,7 +1385,8 @@ class YydsLogger:
         archive_pattern = re.compile(
             r"^"
             + re.escape(root)
-            + r"\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?(?:\.\d+)?"
+            + r"\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?"
+            + r"(?:\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?|\.\d+)*"
             + re.escape(archive_suffix)
             + r"$"
         )
@@ -1360,7 +1401,7 @@ class YydsLogger:
                 try:
                     if os.path.getmtime(absolute_path) <= deadline:
                         os.remove(absolute_path)
-                except FileNotFoundError:
+                except OSError:
                     continue
 
         return retain_archives
@@ -1615,19 +1656,31 @@ class YydsLogger:
 
     def __getattr__(self, name: str) -> Any:
         """
-        使 YydsLogger 支持直接调用 Loguru 的日志级别方法。
+        使 YydsLogger 支持直接访问底层 Loguru Logger 的辅助方法（如 add/remove/catch/opt/patch）。
 
         Args:
             name (str): 属性名称。
         """
-        # 防止初始化异常时 _logger_d1 尚未创建导致无限递归
-        if name.startswith('_'):
+        # 防止初始化异常时 logger 尚未创建导致无限递归
+        if name.startswith("_"):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-        self._ensure_open()
+        raw_target = self.__dict__.get("logger")
+        if raw_target is None:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         try:
-            return getattr(self._logger_d1, name)
+            attr = getattr(raw_target, name)
         except AttributeError:
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            ) from None
+        if getattr(self, "_cleanup_state", "open") != "open":
+            if callable(attr):
+                def _closed_method(*args: Any, **kwargs: Any) -> Any:
+                    self._ensure_open()
+
+                return _closed_method
+            self._ensure_open()
+        return attr
 
     def level(self, name: str, no: Any = None, color: Any = None, icon: Any = None) -> Any:
         self._ensure_open()

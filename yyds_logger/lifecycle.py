@@ -5,6 +5,7 @@ import signal
 import sys
 import threading
 import traceback
+import weakref
 
 
 def setup_exception_handler(logger) -> None:
@@ -18,6 +19,7 @@ def setup_exception_handler(logger) -> None:
     previous_excepthook = sys.excepthook
     previous_threading_hook = getattr(threading, "excepthook", None)
     default_threading_hook = getattr(threading, "__excepthook__", None)
+    logger_ref = weakref.ref(logger)
 
     def call_previous(previous, default, *args) -> None:
         if not callable(previous) or previous is default:
@@ -35,7 +37,8 @@ def setup_exception_handler(logger) -> None:
             except Exception:
                 pass
             return
-        if getattr(logger, "_cleanup_state", "open") != "open":
+        owner = logger_ref()
+        if owner is None or getattr(owner, "_cleanup_state", "open") != "open":
             call_previous(
                 previous_excepthook,
                 sys.__excepthook__,
@@ -46,30 +49,30 @@ def setup_exception_handler(logger) -> None:
             return
         try:
             tb = traceback.extract_tb(exc_traceback)
-            error_msg = logger._msg("UNHANDLED_EXCEPTION")
+            error_msg = owner._msg("UNHANDLED_EXCEPTION")
             exc_value_str = str(exc_value) if exc_value is not None else "None"
             if tb:
                 last_frame = tb[-1]
                 error_location = f"{last_frame.filename}:{last_frame.lineno}:{last_frame.name}"
-                line_content = last_frame.line.strip() if last_frame.line else logger._msg("UNKNOWN_CODE_LINE")
+                line_content = last_frame.line.strip() if last_frame.line else owner._msg("UNKNOWN_CODE_LINE")
             else:
-                error_location = logger._msg("UNKNOWN_LOCATION")
-                line_content = logger._msg("UNKNOWN_CODE_LINE")
+                error_location = owner._msg("UNKNOWN_LOCATION")
+                line_content = owner._msg("UNKNOWN_CODE_LINE")
             full_error_msg = (
                 f"{error_msg}: {exc_type.__name__}: {exc_value_str} | "
-                f"{logger._msg('LABEL_LOCATION')}: {error_location} | "
-                f"{logger._msg('LABEL_CODE')}: {line_content}"
+                f"{owner._msg('LABEL_LOCATION')}: {error_location} | "
+                f"{owner._msg('LABEL_CODE')}: {line_content}"
             )
-            logger.logger.opt(exception=(exc_type, exc_value, exc_traceback)).error(full_error_msg)
+            owner.logger.opt(exception=(exc_type, exc_value, exc_traceback)).error(full_error_msg)
             if len(tb) > 1:
                 chain = " -> ".join(
                     f"{frame.filename}:{frame.lineno}:{frame.name}" for frame in tb[-3:]
                 )
-                logger.logger.error(logger._msg("CALL_CHAIN", chain=chain))
+                owner.logger.error(owner._msg("CALL_CHAIN", chain=chain))
         except Exception:
             try:
-                logger.logger.error(
-                    f"{logger._msg('UNHANDLED_EXCEPTION')}: {exc_type.__name__}"
+                owner.logger.error(
+                    f"{owner._msg('UNHANDLED_EXCEPTION')}: {exc_type.__name__}"
                 )
             except Exception:
                 pass
@@ -93,14 +96,19 @@ def setup_exception_handler(logger) -> None:
             except Exception:
                 pass
             return
-        try:
-            thread_name = getattr(args.thread, "name", "?")
-            logger.logger.opt(exception=(args.exc_type, args.exc_value, args.exc_traceback)).error(
-                logger._msg("THREAD_UNHANDLED_EXCEPTION", thread=thread_name,
-                            error_type=args.exc_type.__name__)
-            )
-        except Exception:
-            pass
+        owner = logger_ref()
+        if owner is not None and getattr(owner, "_cleanup_state", "open") == "open":
+            try:
+                thread_name = getattr(args.thread, "name", "?")
+                owner.logger.opt(exception=(args.exc_type, args.exc_value, args.exc_traceback)).error(
+                    owner._msg(
+                        "THREAD_UNHANDLED_EXCEPTION",
+                        thread=thread_name,
+                        error_type=args.exc_type.__name__,
+                    )
+                )
+            except Exception:
+                pass
         call_previous(previous_threading_hook, default_threading_hook, args)
 
     try:
@@ -118,24 +126,49 @@ def setup_exception_handler(logger) -> None:
     logger._prev_threading_excepthook = previous_threading_hook
     logger._exception_hook = exception_handler
     logger._threading_exception_hook = thread_excepthook
+    finalizer_state = getattr(logger, "_finalizer_state", None)
+    if isinstance(finalizer_state, dict):
+        finalizer_state["exception_hook_state"] = {
+            "exception_hook": exception_handler,
+            "prev_excepthook": previous_excepthook,
+            "threading_exception_hook": thread_excepthook,
+            "prev_threading_excepthook": previous_threading_hook,
+        }
+
+
+def restore_exception_hook_state(state) -> None:
+    """Restore process exception hooks from a saved state dictionary."""
+    if not state:
+        return
+    exc_hook = state.get("exception_hook")
+    prev_exc = state.get("prev_excepthook")
+    thr_hook = state.get("threading_exception_hook")
+    prev_thr = state.get("prev_threading_excepthook")
+    if exc_hook is not None and sys.excepthook is exc_hook:
+        sys.excepthook = prev_exc or sys.__excepthook__
+    if thr_hook is not None and getattr(threading, "excepthook", None) is thr_hook:
+        threading.excepthook = (
+            prev_thr or getattr(threading, "__excepthook__", threading.excepthook)
+        )
 
 
 def restore_exception_handler(logger) -> None:
     """Restore hooks only while they are still owned by this logger."""
-    if logger._exception_hook is not None and sys.excepthook is logger._exception_hook:
-        sys.excepthook = logger._prev_excepthook or sys.__excepthook__
-    if (
-        logger._threading_exception_hook is not None
-        and getattr(threading, "excepthook", None) is logger._threading_exception_hook
-    ):
-        threading.excepthook = (
-            logger._prev_threading_excepthook
-            or getattr(threading, "__excepthook__", threading.excepthook)
-        )
+    restore_exception_hook_state(
+        {
+            "exception_hook": logger._exception_hook,
+            "prev_excepthook": logger._prev_excepthook,
+            "threading_exception_hook": logger._threading_exception_hook,
+            "prev_threading_excepthook": logger._prev_threading_excepthook,
+        }
+    )
     logger._exception_hook = None
     logger._threading_exception_hook = None
     logger._prev_excepthook = None
     logger._prev_threading_excepthook = None
+    finalizer_state = getattr(logger, "_finalizer_state", None)
+    if isinstance(finalizer_state, dict):
+        finalizer_state["exception_hook_state"] = None
 
 
 def _start_signal_cleanup_worker(logger) -> None:
@@ -150,6 +183,13 @@ def _start_signal_cleanup_worker(logger) -> None:
     logger._signal_cleanup_stop = cleanup_stop
     logger._signal_cleanup_default_signal = None
     logger._signal_cleanup_error = None
+    logger_ref = weakref.ref(logger)
+    finalizer_state = getattr(logger, "_finalizer_state", None)
+    if isinstance(finalizer_state, dict):
+        sig_state = finalizer_state.get("signal_state")
+        if isinstance(sig_state, dict):
+            sig_state["event"] = cleanup_event
+            sig_state["stop"] = cleanup_stop
 
     def cleanup_worker() -> None:
         while True:
@@ -157,19 +197,22 @@ def _start_signal_cleanup_worker(logger) -> None:
             cleanup_event.clear()
             if cleanup_stop.is_set():
                 return
+            owner = logger_ref()
+            if owner is None:
+                return
             try:
-                logger.cleanup()
+                owner.cleanup()
             except BaseException as exc:
                 # ``cleanup()`` records its state and remains retryable. Keep
                 # the exception available for diagnostics without allowing a
                 # daemon-thread traceback to terminate the application.
-                logger._signal_cleanup_error = exc
+                owner._signal_cleanup_error = exc
 
             # Defer the default action until queues have had a chance to
             # drain. A ``None`` frame denotes a direct/manual hook call; do
             # not terminate the hosting process in that case.
-            pending_signal = logger._signal_cleanup_default_signal
-            logger._signal_cleanup_default_signal = None
+            pending_signal = owner._signal_cleanup_default_signal
+            owner._signal_cleanup_default_signal = None
             if pending_signal is not None:
                 try:
                     os.kill(os.getpid(), pending_signal)
@@ -210,8 +253,19 @@ def setup_signal_handlers(logger) -> None:
         logger._release_global_resource("signal_handlers")
         raise
 
+    logger_ref = weakref.ref(logger)
+    sig_state = {
+        "event": logger._signal_cleanup_event,
+        "stop": logger._signal_cleanup_stop,
+        "prev_handlers": logger._prev_signal_handlers,
+        "installed_handlers": logger._signal_handlers,
+    }
+
     def handler(signum, frame):
-        previous = logger._prev_signal_handlers.get(signum)
+        owner = logger_ref()
+        prev_map = owner._prev_signal_handlers if owner is not None else sig_state["prev_handlers"]
+        inst_map = owner._signal_handlers if owner is not None else sig_state["installed_handlers"]
+        previous = prev_map.get(signum)
         if previous == signal.SIG_IGN:
             return
         # ``signal.signal()`` is only legal from the main thread. Restore all
@@ -219,10 +273,8 @@ def setup_signal_handlers(logger) -> None:
         # worker's normal cleanup path could never release this resource.
         remaining_previous = {}
         remaining_installed = {}
-        for installed_signal, previous_handler in list(
-            logger._prev_signal_handlers.items()
-        ):
-            installed = logger._signal_handlers.get(installed_signal)
+        for installed_signal, previous_handler in list(prev_map.items()):
+            installed = inst_map.get(installed_signal)
             try:
                 if installed is not None and signal.getsignal(installed_signal) is installed:
                     signal.signal(installed_signal, previous_handler)
@@ -230,20 +282,33 @@ def setup_signal_handlers(logger) -> None:
                 remaining_previous[installed_signal] = previous_handler
                 if installed is not None:
                     remaining_installed[installed_signal] = installed
-        logger._prev_signal_handlers = remaining_previous
-        logger._signal_handlers = remaining_installed
-        if previous == signal.SIG_DFL and frame is not None:
-            logger._signal_cleanup_default_signal = signum
-        try:
-            if callable(previous):
-                try:
-                    previous(signum, frame)
-                except Exception:
-                    pass
-        finally:
-            logger._signal_cleanup_event.set()
-        # The default action is re-issued by the worker after cleanup. This
-        # keeps SIGTERM/SIGINT graceful while preserving normal termination.
+        sig_state["prev_handlers"] = remaining_previous
+        sig_state["installed_handlers"] = remaining_installed
+        if owner is not None:
+            owner._prev_signal_handlers = remaining_previous
+            owner._signal_handlers = remaining_installed
+            if previous == signal.SIG_DFL and frame is not None:
+                owner._signal_cleanup_default_signal = signum
+            try:
+                if callable(previous):
+                    try:
+                        previous(signum, frame)
+                    except Exception:
+                        pass
+            finally:
+                owner._signal_cleanup_event.set()
+            return
+
+        if callable(previous):
+            try:
+                previous(signum, frame)
+            except Exception:
+                pass
+        elif previous == signal.SIG_DFL and frame is not None:
+            try:
+                os.kill(os.getpid(), signum)
+            except OSError:
+                pass
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -258,6 +323,47 @@ def setup_signal_handlers(logger) -> None:
         logger._signal_cleanup_event.set()
         logger._signal_cleanup_thread = None
         logger._release_global_resource("signal_handlers")
+        return
+
+    finalizer_state = getattr(logger, "_finalizer_state", None)
+    if isinstance(finalizer_state, dict):
+        finalizer_state["signal_state"] = sig_state
+
+
+def restore_signal_handler_state(sig_state, *, strict: bool = True) -> None:
+    """Stop the signal cleanup worker and restore signal handlers when on main thread."""
+    if not sig_state:
+        return
+    cleanup_stop = sig_state.get("stop")
+    cleanup_event = sig_state.get("event")
+    if cleanup_stop is not None:
+        cleanup_stop.set()
+    if cleanup_event is not None:
+        cleanup_event.set()
+
+    prev_map = sig_state.get("prev_handlers") or {}
+    inst_map = sig_state.get("installed_handlers") or {}
+    if not prev_map or threading.current_thread() is not threading.main_thread():
+        return
+
+    remaining_previous = {}
+    remaining_installed = {}
+    first_error = None
+    for sig, previous in list(prev_map.items()):
+        installed = inst_map.get(sig)
+        try:
+            if installed is not None and signal.getsignal(sig) is installed:
+                signal.signal(sig, previous)
+        except Exception as exc:
+            remaining_previous[sig] = previous
+            if installed is not None:
+                remaining_installed[sig] = installed
+            if first_error is None:
+                first_error = exc
+    sig_state["prev_handlers"] = remaining_previous
+    sig_state["installed_handlers"] = remaining_installed
+    if strict and first_error is not None:
+        raise RuntimeError("Failed to restore signal handlers") from first_error
 
 
 def restore_signal_handlers(logger) -> None:
@@ -271,7 +377,10 @@ def restore_signal_handlers(logger) -> None:
         # deadlock, and it is daemonized by design.
         cleanup_event.set()
 
+    finalizer_state = getattr(logger, "_finalizer_state", None)
     if not logger._prev_signal_handlers:
+        if isinstance(finalizer_state, dict):
+            finalizer_state["signal_state"] = None
         return
     remaining_previous = {}
     remaining_installed = {}
@@ -290,5 +399,13 @@ def restore_signal_handlers(logger) -> None:
                 first_error = exc
     logger._prev_signal_handlers = remaining_previous
     logger._signal_handlers = remaining_installed
+    if isinstance(finalizer_state, dict):
+        if remaining_previous:
+            sig_state = finalizer_state.get("signal_state")
+            if isinstance(sig_state, dict):
+                sig_state["prev_handlers"] = remaining_previous
+                sig_state["installed_handlers"] = remaining_installed
+        else:
+            finalizer_state["signal_state"] = None
     if first_error is not None:
         raise RuntimeError("Failed to restore signal handlers") from first_error

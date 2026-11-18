@@ -82,7 +82,7 @@ class Compression:
     def copy_compress(path_in, path_out, opener, **kwargs):
         with open(path_in, "rb") as f_in:
             with opener(path_out, **kwargs) as f_out:
-                shutil.copyfileobj(f_in, f_out)
+                shutil.copyfileobj(f_in, f_out, length=262144)
 
     @staticmethod
     def compression(path_in, ext, compress_function):
@@ -93,7 +93,15 @@ class Compression:
             root, ext_before = os.path.splitext(path_in)
             renamed_path = generate_rename_path(root, ext_before + ext, creation_time)
             os.rename(path_out, renamed_path)
-        compress_function(path_in, path_out)
+        try:
+            compress_function(path_in, path_out)
+        except BaseException:
+            if os.path.exists(path_out):
+                try:
+                    os.remove(path_out)
+                except OSError:
+                    pass
+            raise
         os.remove(path_in)
 
 
@@ -254,18 +262,34 @@ class FileSink:
             and self._rotation_function is self._fast_rotation_fn
         ):
             msg_bytes = self._message_byte_len(message)
+            post_rotate_error = None
             if self._should_rotate_size(msg_bytes):
-                self._terminate_file(is_rotating=True)
+                try:
+                    self._terminate_file(is_rotating=True)
+                except Exception as exc:
+                    if self._file is None:
+                        raise
+                    post_rotate_error = exc
             self._file.write(message)
             self._file_size += msg_bytes
+            if post_rotate_error is not None:
+                raise post_rotate_error
             return
 
+        post_rotate_error = None
         if self._rotation_function is not None and self._rotation_function(message, self._file):
-            self._terminate_file(is_rotating=True)
+            try:
+                self._terminate_file(is_rotating=True)
+            except Exception as exc:
+                if self._file is None:
+                    raise
+                post_rotate_error = exc
 
         self._file.write(message)
         if self._size_limit is not None:
             self._file_size += self._message_byte_len(message)
+        if post_rotate_error is not None:
+            raise post_rotate_error
 
     def write(self, message):
         with self._lock:
@@ -383,6 +407,7 @@ class FileSink:
 
     def _terminate_file(self, *, is_rotating=False):
         old_path = self._file_path
+        new_path = None
 
         if self._file is not None:
             self._close_file()
@@ -398,6 +423,9 @@ class FileSink:
                 os.rename(old_path, renamed_path)
                 old_path = renamed_path
 
+            self._create_file(new_path)
+            set_ctime(new_path, datetime.datetime.now().timestamp())
+
         if is_rotating or self._rotation_function is None:
             if self._compression_function is not None and old_path is not None:
                 self._compression_function(old_path)
@@ -408,12 +436,9 @@ class FileSink:
                     for pattern in self._glob_patterns
                     for file in glob.glob(pattern)
                     if os.path.isfile(file)
+                    and (not is_rotating or os.path.abspath(file) != new_path)
                 }
                 self._retention_function(list(logs))
-
-        if is_rotating:
-            self._create_file(new_path)
-            set_ctime(new_path, datetime.datetime.now().timestamp())
 
     @staticmethod
     def _make_glob_patterns(path):
@@ -492,7 +517,9 @@ class FileSink:
             if ext == "gz":
                 import gzip
 
-                compress = partial(Compression.copy_compress, opener=gzip.open, mode="wb")
+                compress = partial(
+                    Compression.copy_compress, opener=gzip.open, mode="wb", compresslevel=6
+                )
             elif ext == "bz2":
                 import bz2
 

@@ -43,8 +43,25 @@ def _leave_trace() -> None:
     _TRACE_STATE.task = None
 
 
+def _unwrap_target(func):
+    try:
+        unwrapped = inspect.unwrap(func)
+    except Exception:
+        unwrapped = func
+    if not hasattr(unwrapped, "__code__") and callable(unwrapped):
+        call_method = getattr(unwrapped, "__call__", None)
+        if hasattr(call_method, "__code__"):
+            return call_method
+    return unwrapped
+
+
+def _callable_name(func) -> str:
+    return getattr(func, "__name__", None) or getattr(func, "__qualname__", None) or type(func).__name__
+
+
 def run_sync(logger, func, *args, **kwargs):
-    target_code = getattr(func, "__code__", None)
+    profile_target = _unwrap_target(func)
+    target_code = getattr(profile_target, "__code__", None)
     if getattr(_TRACE_STATE, "active", False):
         if (
             target_code is not None
@@ -53,6 +70,13 @@ def run_sync(logger, func, *args, **kwargs):
         ):
             return func(*args, **kwargs)
         raise RuntimeError(logger._msg("ERR_PROFILING_BUSY"))
+
+    if target_code is None:
+        start = perf_counter()
+        result = func(*args, **kwargs)
+        duration_ms = (perf_counter() - start) * 1000.0
+        print_report(logger, profile_target, duration_ms, {}, {})
+        return result
 
     try:
         from line_profiler import LineProfiler  # type: ignore
@@ -63,17 +87,29 @@ def run_sync(logger, func, *args, **kwargs):
         _enter_trace(target_code, task=None)
         try:
             start = perf_counter()
-            result = profiler(func)(*args, **kwargs)
+            if profile_target is func:
+                result = profiler(func)(*args, **kwargs)
+            elif hasattr(profiler, "add_function") and hasattr(profiler, "enable_by_count"):
+                profiler.add_function(profile_target)
+                profiler.enable_by_count()
+                try:
+                    result = func(*args, **kwargs)
+                finally:
+                    profiler.disable_by_count()
+            else:
+                result = profiler(func)(*args, **kwargs)
             duration_ms = (perf_counter() - start) * 1000.0
-            line_times, line_hits = _extract_stats(profiler.get_stats(), func)
+            line_times, line_hits = _extract_stats(profiler.get_stats(), profile_target)
         finally:
             _leave_trace()
     else:
         try:
-            result, duration_ms, line_times, line_hits = _trace_sync(func, *args, **kwargs)
+            result, duration_ms, line_times, line_hits = _trace_sync(
+                func, *args, _target_code=target_code, **kwargs
+            )
         except ProfilingBusyError as exc:
             raise RuntimeError(logger._msg("ERR_PROFILING_BUSY")) from exc
-    print_report(logger, func, duration_ms, line_times, line_hits)
+    print_report(logger, profile_target, duration_ms, line_times, line_hits)
     return result
 
 
@@ -82,7 +118,8 @@ def run_async(logger, func, *args, **kwargs):
 
 
 async def _run_async(logger, func, *args, **kwargs):
-    target_code = getattr(func, "__code__", None)
+    profile_target = _unwrap_target(func)
+    target_code = getattr(profile_target, "__code__", None)
     current_task = asyncio.current_task()
     if getattr(_TRACE_STATE, "active", False):
         if (
@@ -92,6 +129,13 @@ async def _run_async(logger, func, *args, **kwargs):
         ):
             return await func(*args, **kwargs)
         raise RuntimeError(logger._msg("ERR_PROFILING_BUSY"))
+
+    if target_code is None:
+        start = perf_counter()
+        result = await func(*args, **kwargs)
+        duration_ms = (perf_counter() - start) * 1000.0
+        print_report(logger, profile_target, duration_ms, {}, {})
+        return result
 
     try:
         from line_profiler import LineProfiler  # type: ignore
@@ -103,19 +147,29 @@ async def _run_async(logger, func, *args, **kwargs):
         _enter_trace(target_code, task=current_task)
         try:
             start = perf_counter()
-            result = await profiler(func)(*args, **kwargs)
+            if profile_target is func:
+                result = await profiler(func)(*args, **kwargs)
+            elif hasattr(profiler, "add_function") and hasattr(profiler, "enable_by_count"):
+                profiler.add_function(profile_target)
+                profiler.enable_by_count()
+                try:
+                    result = await func(*args, **kwargs)
+                finally:
+                    profiler.disable_by_count()
+            else:
+                result = await profiler(func)(*args, **kwargs)
             duration_ms = (perf_counter() - start) * 1000.0
-            line_times, line_hits = _extract_stats(profiler.get_stats(), func)
+            line_times, line_hits = _extract_stats(profiler.get_stats(), profile_target)
         finally:
             _leave_trace()
     else:
         try:
             result, duration_ms, line_times, line_hits = await _trace_async(
-                func, *args, _current_task=current_task, **kwargs
+                func, *args, _current_task=current_task, _target_code=target_code, **kwargs
             )
         except ProfilingBusyError as exc:
             raise RuntimeError(logger._msg("ERR_PROFILING_BUSY")) from exc
-    print_report(logger, func, duration_ms, line_times, line_hits)
+    print_report(logger, profile_target, duration_ms, line_times, line_hits)
     return result
 
 
@@ -171,11 +225,12 @@ def _build_line_tracer(target_code):
     return global_tracer, line_times, line_hits
 
 
-def _trace_sync(func, *args, **kwargs):
+def _trace_sync(func, *args, _target_code=None, **kwargs):
     return_value = None
-    tracer, line_times, line_hits = _build_line_tracer(func.__code__)
+    code = _target_code if _target_code is not None else func.__code__
+    tracer, line_times, line_hits = _build_line_tracer(code)
 
-    _enter_trace(func.__code__)
+    _enter_trace(code)
     try:
         old_trace = sys.gettrace()
         sys.settrace(tracer)
@@ -189,10 +244,11 @@ def _trace_sync(func, *args, **kwargs):
     return return_value, (perf_counter() - start) * 1000.0, line_times, line_hits
 
 
-async def _trace_async(func, *args, _current_task=None, **kwargs):
-    tracer, line_times, line_hits = _build_line_tracer(func.__code__)
+async def _trace_async(func, *args, _current_task=None, _target_code=None, **kwargs):
+    code = _target_code if _target_code is not None else func.__code__
+    tracer, line_times, line_hits = _build_line_tracer(code)
 
-    _enter_trace(func.__code__, task=_current_task)
+    _enter_trace(code, task=_current_task)
     try:
         old_trace = sys.gettrace()
         sys.settrace(tracer)
@@ -209,16 +265,18 @@ async def _trace_async(func, *args, _current_task=None, **kwargs):
 def print_report(logger, func, total_duration_ms, line_times, line_hits):
     if getattr(logger, "_cleanup_state", "open") != "open":
         return
+    func_name = _callable_name(func)
     d3_logger = logger.logger.opt(depth=3)
     try:
         lines, start_line = inspect.getsourcelines(func)
     except Exception as exc:
         d3_logger.warning(
-            logger._msg("CANNOT_GET_SOURCE", func=func.__name__, error=str(exc))
+            logger._msg("CANNOT_GET_SOURCE", func=func_name, error=str(exc))
         )
         return
 
-    report = ["=" * 80, logger._msg("LINE_PROFILE_REPORT_HEADER", func=func.__name__), "=" * 80]
+    safe_func_name = _escape_color_tags(func_name)
+    report = ["=" * 80, logger._msg("LINE_PROFILE_REPORT_HEADER", func=safe_func_name), "=" * 80]
     report.append(
         f"{logger._msg('COL_LINE_NO'):<6} | {logger._msg('COL_HITS'):<8} | "
         f"{logger._msg('COL_TOTAL_TIME'):<12} | {logger._msg('COL_AVG_TIME'):<12} | "

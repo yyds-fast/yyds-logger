@@ -3,13 +3,16 @@ import os
 
 def load_ctime_functions():
     if os.name == "nt":
-        import win32_setctime
+        try:
+            import win32_setctime
+        except ImportError:
+            win32_setctime = None
 
         def get_ctime_windows(filepath):
             return os.stat(filepath).st_ctime
 
         def set_ctime_windows(filepath, timestamp):
-            if not win32_setctime.SUPPORTED:
+            if win32_setctime is None or not getattr(win32_setctime, "SUPPORTED", False):
                 return
 
             try:

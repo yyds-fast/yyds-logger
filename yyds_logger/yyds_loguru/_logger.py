@@ -88,6 +88,7 @@ import builtins
 import contextlib
 import functools
 import logging
+import os
 import re
 import sys
 import threading
@@ -130,6 +131,21 @@ context = ContextVar("loguru_context", default={})
 def _get_file_and_module(co_filename):
     file_name = basename(co_filename)
     return file_name, splitext(file_name)[0]
+
+
+_CACHED_PID = os.getpid()
+_CACHED_PROCESS_NAME = None
+_CACHED_RECORD_PROCESS = None
+
+
+def _refresh_fork_pid():
+    global _CACHED_PID, _CACHED_RECORD_PROCESS
+    _CACHED_PID = os.getpid()
+    _CACHED_RECORD_PROCESS = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_refresh_fork_pid)
 
 
 class Core:
@@ -188,7 +204,14 @@ class Core:
         # It can also contain integers as keys, it serves to avoid calling "isinstance()" repeatedly
         # when "logger.log()" is used.
         self.levels_lookup = {
-            name: (name, name, level.no, level.icon) for name, level in self.levels.items()
+            name: (
+                name,
+                name,
+                level.no,
+                level.icon,
+                RecordLevel(name, level.no, level.icon),
+            )
+            for name, level in self.levels.items()
         }
 
         self.handlers_count = 0
@@ -1680,7 +1703,13 @@ class Logger:
         with self._core.lock:
             self._core.levels[name] = level
             self._core.levels_ansi_codes[name] = ansi
-            self._core.levels_lookup[name] = (name, name, no, icon)
+            self._core.levels_lookup[name] = (
+                name,
+                name,
+                no,
+                icon,
+                RecordLevel(name, no, icon),
+            )
             for handler in self._core.handlers.values():
                 handler.update_format(name)
 
@@ -1986,7 +2015,7 @@ class Logger:
             return
 
         try:
-            level_id, level_name, level_no, level_icon = core.levels_lookup[level]
+            level_id, _, level_no, _, record_level = core.levels_lookup[level]
         except (KeyError, TypeError):
             if isinstance(level, str):
                 raise ValueError("Level '%s' does not exist" % level) from None
@@ -1999,8 +2028,10 @@ class Logger:
                 raise ValueError(
                     "Invalid level value, it should be a positive integer, not: %d" % level
                 ) from None
-            cache = (None, "Level %d" % level, level, " ")
-            level_id, level_name, level_no, level_icon = cache
+            level_name = "Level %d" % level
+            record_level = RecordLevel(level_name, level, " ")
+            cache = (None, level_name, level, " ", record_level)
+            level_id, level_no = None, level
             core.levels_lookup[level] = cache
 
         if level_no < core.min_level:
@@ -2051,6 +2082,14 @@ class Logger:
         file_name, module_name = _get_file_and_module(co_filename)
         thread = current_thread()
         process = current_process()
+        proc_name = process.name
+        global _CACHED_PID, _CACHED_PROCESS_NAME, _CACHED_RECORD_PROCESS
+        record_process = _CACHED_RECORD_PROCESS
+        if record_process is None or _CACHED_PROCESS_NAME != proc_name:
+            _CACHED_PID = os.getpid()
+            _CACHED_PROCESS_NAME = proc_name
+            record_process = RecordProcess(_CACHED_PID, proc_name)
+            _CACHED_RECORD_PROCESS = record_process
         elapsed = current_datetime - start_time
 
         if exception:
@@ -2070,12 +2109,12 @@ class Logger:
             "extra": {**core.extra, **core.context.get(), **extra},
             "file": RecordFile(file_name, co_filename),
             "function": co_name,
-            "level": RecordLevel(level_name, level_no, level_icon),
+            "level": record_level,
             "line": f_lineno,
             "message": str(message),
             "module": module_name,
             "name": name,
-            "process": RecordProcess(process.ident, process.name),
+            "process": record_process,
             "thread": RecordThread(thread.ident, thread.name),
             "time": current_datetime,
         }

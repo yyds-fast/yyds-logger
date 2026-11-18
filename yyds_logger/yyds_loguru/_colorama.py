@@ -3,6 +3,33 @@ import os
 import sys
 
 
+def _enable_windows_vt(stream):
+    try:
+        import ctypes
+        import msvcrt
+
+        fileno = stream.fileno()
+        handle = msvcrt.get_osfhandle(fileno)
+        kernel32 = ctypes.windll.kernel32
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        enable_vt = 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if mode.value & enable_vt:
+            return True
+        return bool(kernel32.SetConsoleMode(handle, mode.value | enable_vt))
+    except Exception:
+        return False
+
+
+def _has_colorama():
+    try:
+        import colorama  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def should_colorize(stream):
     if stream is None:
         return False
@@ -33,9 +60,17 @@ def should_colorize(stream):
             return True
 
     try:
-        return stream.isatty()
+        is_tty = stream.isatty()
     except Exception:
         return False
+
+    if not is_tty:
+        return False
+
+    if os.name == "nt" and (stream is sys.__stdout__ or stream is sys.__stderr__):
+        return _enable_windows_vt(stream) or _has_colorama()
+
+    return True
 
 
 def should_wrap(stream):
@@ -45,7 +80,13 @@ def should_wrap(stream):
     if stream is not sys.__stdout__ and stream is not sys.__stderr__:
         return False
 
-    from colorama.win32 import winapi_test
+    if _enable_windows_vt(stream):
+        return False
+
+    try:
+        from colorama.win32 import winapi_test
+    except ImportError:
+        return False
 
     if not winapi_test():
         return False
@@ -62,6 +103,9 @@ def should_wrap(stream):
 
 
 def wrap(stream):
-    from colorama import AnsiToWin32
+    try:
+        from colorama import AnsiToWin32
+    except ImportError:
+        return stream
 
     return AnsiToWin32(stream, convert=True, strip=True, autoreset=False).stream

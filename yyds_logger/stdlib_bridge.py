@@ -9,6 +9,12 @@ from typing import List, Optional
 from .i18n import get_message
 
 
+_STD_LEVEL_ALIASES = {
+    "WARN": "WARNING",
+    "FATAL": "CRITICAL",
+}
+
+
 def capture_std_logging(logger, level: str = "DEBUG",
                         names: Optional[List[str]] = None,
                         clear_existing: bool = False) -> None:
@@ -48,6 +54,10 @@ def capture_std_logging(logger, level: str = "DEBUG",
             if not core.handlers:
                 return
             level_entry = core.levels_lookup.get(record.levelname)
+            if level_entry is None:
+                alias = _STD_LEVEL_ALIASES.get(record.levelname)
+                if alias is not None:
+                    level_entry = core.levels_lookup.get(alias)
             if level_entry is not None:
                 level_name = level_entry[1]
                 level_no = level_entry[2]
@@ -99,20 +109,23 @@ def capture_std_logging(logger, level: str = "DEBUG",
             target.propagate = propagate
         logger._release_global_resource("stdlib_logging")
         raise
-    logger._std_logging_state = {
+    state = {
         "targets": saved,
         "handler": handler,
         "clear_existing": bool(clear_existing),
         "level": level_no,
         "named": bool(names),
     }
+    logger._std_logging_state = state
+    finalizer_state = getattr(logger, "_finalizer_state", None)
+    if isinstance(finalizer_state, dict):
+        finalizer_state["std_logging_state"] = state
 
 
-def restore_std_logging(logger) -> None:
-    """Restore logging handlers and levels changed by ``capture_std_logging``."""
-    state = logger._std_logging_state
+def restore_std_logging_state(state: Optional[dict], *, strict: bool = True) -> Optional[dict]:
+    """Restore standard logging targets from a saved state dictionary."""
     if not state:
-        return
+        return None
     targets = state["targets"]
     intercept_handler = state["handler"]
     clear_existing = state["clear_existing"]
@@ -147,6 +160,26 @@ def restore_std_logging(logger) -> None:
 
     if failed_targets:
         state["targets"] = failed_targets
+        if strict:
+            raise RuntimeError("Failed to restore standard logging state") from first_error
+        return state
+    return None
+
+
+def restore_std_logging(logger) -> None:
+    """Restore logging handlers and levels changed by ``capture_std_logging``."""
+    state = logger._std_logging_state
+    if not state:
+        return
+    try:
+        remaining = restore_std_logging_state(state, strict=True)
+    except Exception:
         logger._std_logging_state = state
-        raise RuntimeError("Failed to restore standard logging state") from first_error
-    logger._std_logging_state = None
+        finalizer_state = getattr(logger, "_finalizer_state", None)
+        if isinstance(finalizer_state, dict):
+            finalizer_state["std_logging_state"] = state
+        raise
+    logger._std_logging_state = remaining
+    finalizer_state = getattr(logger, "_finalizer_state", None)
+    if isinstance(finalizer_state, dict):
+        finalizer_state["std_logging_state"] = remaining

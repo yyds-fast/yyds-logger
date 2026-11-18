@@ -3,7 +3,8 @@ from calendar import day_abbr, day_name, month_abbr, month_name
 from datetime import datetime as datetime_
 from datetime import timedelta, timezone
 from functools import lru_cache, partial
-from time import localtime, strftime
+import time as _time
+from time import localtime, strftime, time
 
 tokens = r"H{1,2}|h{1,2}|m{1,2}|s{1,2}|S+|YYYY|YY|M{1,4}|D{1,4}|Z{1,2}|zz|A|X|x|E|Q|dddd|ddd|d"
 
@@ -154,36 +155,37 @@ class datetime(datetime_):  # noqa: N801
 
 
 _TZ_CACHE = {}
+_LAST_TZ_SECOND = None
+_LAST_TZ_NAMES = None
+_LAST_TZINFO = None
 
 
 def aware_now():
-    now = datetime_.now()
-    timestamp = now.timestamp()
-    local = localtime(timestamp)
+    global _LAST_TZ_SECOND, _LAST_TZ_NAMES, _LAST_TZINFO
+    timestamp = time()
+    sec = int(timestamp)
+    tz_names = _time.tzname
+    tzinfo = _LAST_TZINFO
+    if sec != _LAST_TZ_SECOND or tz_names != _LAST_TZ_NAMES or tzinfo is None:
+        local = localtime(timestamp)
 
-    try:
-        seconds = local.tm_gmtoff
-        zone = local.tm_zone
-    except AttributeError:
-        # Workaround for Python 3.5.
-        utc_naive = datetime_.fromtimestamp(timestamp, tz=timezone.utc).replace(tzinfo=None)
-        offset = datetime_.fromtimestamp(timestamp) - utc_naive
-        seconds = offset.total_seconds()
-        zone = strftime("%Z")
+        try:
+            seconds = local.tm_gmtoff
+            zone = local.tm_zone
+        except AttributeError:
+            # Workaround for Python 3.5.
+            utc_naive = datetime_.fromtimestamp(timestamp, tz=timezone.utc).replace(tzinfo=None)
+            offset = datetime_.fromtimestamp(timestamp) - utc_naive
+            seconds = offset.total_seconds()
+            zone = strftime("%Z")
 
-    key = (seconds, zone)
-    tzinfo = _TZ_CACHE.get(key)
-    if tzinfo is None:
-        tzinfo = timezone(timedelta(seconds=seconds), zone)
-        _TZ_CACHE[key] = tzinfo
+        key = (seconds, zone)
+        tzinfo = _TZ_CACHE.get(key)
+        if tzinfo is None:
+            tzinfo = timezone(timedelta(seconds=seconds), zone)
+            _TZ_CACHE[key] = tzinfo
+        _LAST_TZINFO = tzinfo
+        _LAST_TZ_NAMES = tz_names
+        _LAST_TZ_SECOND = sec
 
-    return datetime(
-        now.year,
-        now.month,
-        now.day,
-        now.hour,
-        now.minute,
-        now.second,
-        now.microsecond,
-        tzinfo=tzinfo,
-    )
+    return datetime.fromtimestamp(timestamp, tzinfo)

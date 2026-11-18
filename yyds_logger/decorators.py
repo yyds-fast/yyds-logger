@@ -5,6 +5,16 @@ from functools import wraps
 from time import perf_counter
 
 
+def _callable_name(obj) -> str:
+    return getattr(obj, "__name__", None) or getattr(obj, "__qualname__", None) or type(obj).__name__
+
+
+def _is_async_callable(obj) -> bool:
+    return inspect.iscoroutinefunction(obj) or inspect.iscoroutinefunction(
+        getattr(obj, "__call__", None)
+    )
+
+
 def log_decorator(logger, msg=None, level="ERROR", trace=True, reraise=True):
     """Log function calls and exceptions.
 
@@ -14,17 +24,18 @@ def log_decorator(logger, msg=None, level="ERROR", trace=True, reraise=True):
     def decorator(func):
         msg_key = msg or "UNHANDLED_EXCEPTION"
         log_level = str(level)
-        if inspect.iscoroutinefunction(func):
+        func_name = _callable_name(func)
+        if _is_async_callable(func):
             @wraps(func)
             async def async_wrapper(*args, **kwargs):
-                logger._log_start(func.__name__, args, kwargs, is_async=True)
+                logger._log_start(func_name, args, kwargs, is_async=True)
                 start = perf_counter()
                 try:
                     result = await func(*args, **kwargs)
-                    logger._log_end(func.__name__, result, perf_counter() - start, is_async=True)
+                    logger._log_end(func_name, result, perf_counter() - start, is_async=True)
                     return result
                 except Exception as exc:
-                    logger._log_exception(func.__name__, exc, msg_key, log_level, trace, is_async=True)
+                    logger._log_exception(func_name, exc, msg_key, log_level, trace, is_async=True)
                     if reraise:
                         raise
                     return None
@@ -32,14 +43,14 @@ def log_decorator(logger, msg=None, level="ERROR", trace=True, reraise=True):
 
         @wraps(func)
         def sync_wrapper(*args, **kwargs):
-            logger._log_start(func.__name__, args, kwargs, is_async=False)
+            logger._log_start(func_name, args, kwargs, is_async=False)
             start = perf_counter()
             try:
                 result = func(*args, **kwargs)
-                logger._log_end(func.__name__, result, perf_counter() - start, is_async=False)
+                logger._log_end(func_name, result, perf_counter() - start, is_async=False)
                 return result
             except Exception as exc:
-                logger._log_exception(func.__name__, exc, msg_key, log_level, trace, is_async=False)
+                logger._log_exception(func_name, exc, msg_key, log_level, trace, is_async=False)
                 if reraise:
                     raise
                 return None
@@ -49,7 +60,8 @@ def log_decorator(logger, msg=None, level="ERROR", trace=True, reraise=True):
 
 def time_it(logger, func=None, *, line_by_line=False):
     def decorator(target):
-        if inspect.iscoroutinefunction(target):
+        target_name = _callable_name(target)
+        if _is_async_callable(target):
             @wraps(target)
             async def async_wrapper(*args, **kwargs):
                 if line_by_line:
@@ -57,7 +69,7 @@ def time_it(logger, func=None, *, line_by_line=False):
                     return await run_async(logger, target, *args, **kwargs)
                 start = perf_counter()
                 result = await target(*args, **kwargs)
-                _log_duration(logger, target.__name__, (perf_counter() - start) * 1000.0)
+                _log_duration(logger, target_name, (perf_counter() - start) * 1000.0)
                 return result
             return async_wrapper
 
@@ -68,7 +80,7 @@ def time_it(logger, func=None, *, line_by_line=False):
                 return run_sync(logger, target, *args, **kwargs)
             start = perf_counter()
             result = target(*args, **kwargs)
-            _log_duration(logger, target.__name__, (perf_counter() - start) * 1000.0)
+            _log_duration(logger, target_name, (perf_counter() - start) * 1000.0)
             return result
         return sync_wrapper
     return decorator(func) if func is not None else decorator

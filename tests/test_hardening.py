@@ -1892,3 +1892,227 @@ def test_handler_pickle_state_clears_owner_process_pid_and_sync_flush_skips_asyn
         logger.cleanup()
 
     assert "fast-flush-record" in (tmp_path / "pickle-and-flush.log").read_text(encoding="utf-8")
+
+
+def test_windows_ctime_and_colorama_work_without_optional_packages(tmp_path, monkeypatch):
+    from yyds_logger.yyds_loguru import _colorama, _ctime_functions
+
+    monkeypatch.setitem(sys.modules, "win32_setctime", None)
+    monkeypatch.setitem(sys.modules, "colorama", None)
+    monkeypatch.setitem(sys.modules, "colorama.win32", None)
+    monkeypatch.setitem(sys.modules, "colorama.winterm", None)
+    monkeypatch.setattr(os, "name", "nt")
+
+    get_ct, set_ct = _ctime_functions.load_ctime_functions()
+    sample = tmp_path / "win.txt"
+    sample.write_text("ok", encoding="utf-8")
+    assert isinstance(get_ct(str(sample)), float)
+    set_ct(str(sample), time.time())
+
+    class FakeTTY:
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            raise OSError("no console handle")
+
+    fake_stdout = FakeTTY()
+    monkeypatch.setattr(sys, "__stdout__", fake_stdout)
+    monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("PYCHARM_HOSTED", raising=False)
+
+    assert _colorama.should_colorize(fake_stdout) is False
+    assert _colorama.should_wrap(fake_stdout) is False
+    assert _colorama.wrap(fake_stdout) is fake_stdout
+
+
+def test_getattr_delegates_with_zero_extra_depth_and_closed_hasattr_is_safe(tmp_path):
+    logger = YydsLogger(
+        "getattr-depth",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    patched = logger.patch(lambda record: None)
+    patched.info("patched-msg")
+    with logger.catch():
+        raise ZeroDivisionError("caught-div")
+    logger.cleanup()
+
+    assert hasattr(logger, "nonexistent_attribute_xyz") is False
+    assert getattr(logger, "nonexistent_attribute_xyz", "fallback") == "fallback"
+    assert hasattr(logger, "add") is True
+    with pytest.raises(RuntimeError):
+        logger.add(lambda m: None)
+
+    content = (tmp_path / "getattr-depth.log").read_text(encoding="utf-8")
+    assert "test_hardening.py:" in content
+    assert "<unknown>:0" not in content
+    assert "patched-msg" in content
+    assert "caught-div" in content
+
+
+@pytest.mark.parametrize("disable_line_profiler", [False, True])
+def test_stacked_decorators_and_lambda_line_profiling_and_partial_callables(
+    tmp_path, monkeypatch, disable_line_profiler
+):
+    import functools
+
+    if disable_line_profiler:
+        monkeypatch.setitem(sys.modules, "line_profiler", None)
+
+    mod_path = tmp_path / "prof_sample_mod.py"
+    mod_path.write_text(
+        "def make_callables(logger):\n"
+        "    @logger.time_it(line_by_line=True)\n"
+        "    @logger.log_decorator()\n"
+        "    def stacked(x):\n"
+        "        y = x + 10\n"
+        "        return y * 2\n"
+        "    lam = logger.time_it(lambda z: z + 5, line_by_line=True)\n"
+        "    return stacked, lam\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    import importlib
+
+    prof_mod = importlib.import_module("prof_sample_mod")
+    importlib.reload(prof_mod)
+
+    logger = YydsLogger(
+        f"prof-stack-{disable_line_profiler}",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="CRITICAL",
+        compression=None,
+    )
+    try:
+        stacked_fn, lam_fn = prof_mod.make_callables(logger)
+        assert stacked_fn(3) == 26
+        assert lam_fn(4) == 9
+
+        part_fn = functools.partial(lambda a, b: a + b, 10)
+        assert logger.log_decorator()(part_fn)(5) == 15
+        assert logger.time_it(part_fn)(7) == 17
+    finally:
+        logger.cleanup()
+
+    content = (tmp_path / f"prof-stack-{disable_line_profiler}.log").read_text(encoding="utf-8")
+    assert "y = x + 10" in content
+    assert "|        1 |" in content
+    assert "<lambda>" in content
+
+
+def test_gc_restores_stdlib_logging_and_releases_exception_and_signal_hooks(tmp_path):
+    import gc
+    import signal
+
+    prev_exc = sys.excepthook
+    prev_thr = threading.excepthook
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+    prev_sigint = signal.getsignal(signal.SIGINT)
+
+    stream = io.StringIO()
+    root = logging.getLogger()
+    root_handler = logging.StreamHandler(stream)
+    orig_root_level = root.level
+    root.addHandler(root_handler)
+    root.setLevel(logging.INFO)
+
+    svc_name = "gc.ephemeral.service"
+    svc_logger = logging.getLogger(svc_name)
+    orig_svc_handlers = list(svc_logger.handlers)
+    orig_svc_level = svc_logger.level
+    orig_svc_prop = svc_logger.propagate
+
+    try:
+        def create_and_abandon():
+            ephemeral = YydsLogger(
+                "ephemeral-gc",
+                log_dir=str(tmp_path),
+                console_level="CRITICAL",
+                compression=None,
+            )
+            ephemeral.capture_std_logging(names=[svc_name], level="INFO")
+            ephemeral.setup_exception_handler()
+            ephemeral.setup_signal_handlers()
+            svc_logger.info("captured-in-ephemeral")
+
+        create_and_abandon()
+        gc.collect()
+
+        assert sys.excepthook is prev_exc
+        assert threading.excepthook is prev_thr
+        assert signal.getsignal(signal.SIGTERM) is prev_sigterm
+        assert signal.getsignal(signal.SIGINT) is prev_sigint
+        assert svc_logger.propagate is True
+        assert all(type(h).__name__ != "_InterceptHandler" for h in svc_logger.handlers)
+
+        svc_logger.info("restored-after-gc")
+        assert "restored-after-gc" in stream.getvalue()
+        assert "captured-in-ephemeral" in (tmp_path / "ephemeral-gc.log").read_text(encoding="utf-8")
+
+        successor = YydsLogger(
+            "successor",
+            log_dir=str(tmp_path),
+            enqueue=False,
+            console_level="CRITICAL",
+            compression=None,
+        )
+        try:
+            successor.setup_exception_handler()
+            successor.setup_signal_handlers()
+            successor.capture_std_logging(names=[svc_name], level="INFO")
+        finally:
+            successor.cleanup()
+    finally:
+        root.removeHandler(root_handler)
+        root.setLevel(orig_root_level)
+        svc_logger.handlers = orig_svc_handlers
+        svc_logger.setLevel(orig_svc_level)
+        svc_logger.propagate = orig_svc_prop
+        sys.excepthook = prev_exc
+        threading.excepthook = prev_thr
+        signal.signal(signal.SIGTERM, prev_sigterm)
+        signal.signal(signal.SIGINT, prev_sigint)
+
+
+def test_rotation_preserves_current_record_when_compression_fails(tmp_path):
+    import functools
+    from yyds_logger.yyds_loguru._file_sink import Compression, FileSink
+
+    stderr_buf = io.StringIO()
+    logger = YydsLogger(
+        "rot-resilient",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="CRITICAL",
+        compression="gz",
+    )
+    try:
+        file_handler = next(
+            h for h in logger.logger._core.handlers.values() if isinstance(h._sink, FileSink)
+        )
+        file_handler._sink._size_limit = 80
+
+        def broken_compress(path_in, path_out):
+            with open(path_out, "wb") as f:
+                f.write(b"partial-corrupt")
+            raise OSError("simulated disk full during gzip")
+
+        file_handler._sink._compression_function = functools.partial(
+            Compression.compression, ext=".gz", compress_function=broken_compress
+        )
+
+        with contextlib.redirect_stderr(stderr_buf):
+            logger.info("first-record-" + "x" * 60)
+            logger.info("second-record-survives-rotation")
+    finally:
+        logger.cleanup()
+
+    active_content = (tmp_path / "rot-resilient.log").read_text(encoding="utf-8")
+    assert "second-record-survives-rotation" in active_content
+    gz_files = list(tmp_path.glob("*.gz"))
+    assert gz_files == []

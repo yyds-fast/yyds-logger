@@ -16,6 +16,16 @@ from ._locks_machinery import create_handler_lock
 
 _FLUSH_MARKER = "__loguru_flush__"
 _PICKLED_MARKER = "__loguru_pickled__"
+_HANDLER_PID = os.getpid()
+
+
+def _refresh_handler_pid():
+    global _HANDLER_PID
+    _HANDLER_PID = os.getpid()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_refresh_handler_pid)
 
 
 class _ThreadQueue:
@@ -479,7 +489,7 @@ class Handler:
             return
 
         if self._queue_backend == "thread":
-            if self._owner_process_pid != os.getpid():
+            if self._owner_process_pid != _HANDLER_PID:
                 self._ensure_thread_writer_current_process()
             try:
                 if self._overflow_policy == "drop":
