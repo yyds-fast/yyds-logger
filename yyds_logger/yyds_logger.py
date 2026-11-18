@@ -16,7 +16,7 @@ import contextlib
 import math
 import traceback
 
-from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple
+from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple, Union
 
 from contextvars import ContextVar
 from datetime import datetime
@@ -137,8 +137,8 @@ class LoggerConfig:
     backtrace: bool
     serialize: bool
     console_serialize: bool
-    console_level: Optional[str]
-    file_level: Optional[str]
+    console_level: Optional[Union[str, int, bool]]
+    file_level: Optional[Union[str, int]]
     queue_size: Optional[int]
     overflow_policy: str
     queue_timeout: Optional[float]
@@ -187,6 +187,9 @@ class YydsLogger:
     _active_shutdown_deadline: Optional[float]
     _signal_cleanup_error: Optional[BaseException]
     _last_good_config: Optional[Dict[str, Any]]
+    _console_level_no: float
+    _file_level_no: float
+    _min_level_no: float
     _CONFIG_FIELDS = (
         "log_dir", "max_size", "retention", "custom_format", "language", "enable_stats",
         "compression", "serialize", "console_serialize",
@@ -217,8 +220,8 @@ class YydsLogger:
         backtrace: Optional[bool] = None,      # 新增：显式覆盖 backtrace
         serialize: bool = False,               # 新增：文件输出 JSON 结构化日志
         console_serialize: bool = False,       # 新增：控制台输出 JSON 结构化日志
-        console_level: Optional[str] = None,   # 新增：控制台独立级别
-        file_level: Optional[str] = None,      # 新增：主文件独立级别
+        console_level: Optional[Union[str, int, bool]] = None,   # 新增：控制台独立级别（False/'OFF' 关闭控制台）
+        file_level: Optional[Union[str, int]] = None,      # 新增：主文件独立级别
         queue_size: Optional[int] = 10000,     # 本地 enqueue 队列容量；None 表示无界队列
         overflow_policy: str = "block",       # block 或 drop
         queue_timeout: Optional[float] = 1.0,  # block 策略的最大等待时间
@@ -322,6 +325,7 @@ class YydsLogger:
         self._failed_handler_stops: List[Any] = []
         self._dropped_messages_total = 0
         self._serialization_errors_total = 0
+        self._sink_errors_total = 0
         self._drop_reasons_total = {
             "overflow": 0,
             "block_timeout": 0,
@@ -523,6 +527,7 @@ class YydsLogger:
         self._failed_handler_stops = []
         self._dropped_messages_total = 0
         self._serialization_errors_total = 0
+        self._sink_errors_total = 0
         self._drop_reasons_total = {
             "overflow": 0,
             "block_timeout": 0,
@@ -760,11 +765,20 @@ class YydsLogger:
         """带缓存的级别号查询，避免每条日志都走 loguru 的级别表查找（热路径优化）。"""
         return self._safe_level_no(name)
 
+    @staticmethod
+    def _is_console_disabled(level_value: Any) -> bool:
+        return level_value is False or (
+            isinstance(level_value, str) and level_value.strip().upper() == "OFF"
+        )
+
     def _refresh_sink_level_nos(self) -> None:
         """Refresh derived level thresholds for every active sink."""
-        self._console_level_no = (
-            0 if self.console_level is None else self._safe_level_no(self.console_level)
-        )
+        if self._is_console_disabled(self.console_level):
+            self._console_level_no = float("inf")
+        elif self.console_level is None:
+            self._console_level_no = 0
+        else:
+            self._console_level_no = self._safe_level_no(self.console_level)
         self._file_level_no = (
             0 if self.file_level is None else self._safe_level_no(self.file_level)
         )
@@ -953,6 +967,7 @@ class YydsLogger:
         self._serialization_errors_total += int(
             getattr(handler, "serialization_errors", 0)
         )
+        self._sink_errors_total += int(getattr(handler, "sink_errors", 0))
         for reason, count in getattr(handler, "drop_reasons", {}).items():
             self._drop_reasons_total[reason] = self._drop_reasons_total.get(reason, 0) + int(count)
 
@@ -1119,9 +1134,11 @@ class YydsLogger:
         staged_logger = create_logger(stderr=False, register_atexit=False)
         current_core = self.logger._core
         staged_core = staged_logger._core
+        console_disabled = self._is_console_disabled(self.console_level)
+        reserved_count = 1 if console_disabled else 2
         with current_core.lock:
             start_id = current_core.handlers_count
-            current_core.handlers_count += 2
+            current_core.handlers_count += reserved_count
             # Preserve custom levels registered through the exposed embedded
             # logger.  Handler construction only needs these immutable lookup
             # tables; the staged core never receives user records.
@@ -1132,7 +1149,10 @@ class YydsLogger:
 
         handler_ids = []
         try:
-            handler_ids.append(self._add_console_handler(log_format, target_logger=staged_logger))
+            if not console_disabled:
+                handler_ids.append(
+                    self._add_console_handler(log_format, target_logger=staged_logger)
+                )
             handler_ids.append(
                 self._add_file_handler(log_format, target_logger=staged_logger, delay=file_delay)
             )
@@ -1305,6 +1325,8 @@ class YydsLogger:
 
     def _resolve_sink_level(self, lvl_name: str, lvl_value: Any, lang: Optional[str] = None) -> Any:
         effective_lang = lang or self.language
+        if lvl_name == "console_level" and self._is_console_disabled(lvl_value):
+            return False if lvl_value is False else "OFF"
         if isinstance(lvl_value, bool):
             raise ValueError(
                 get_message(effective_lang, "ERR_INVALID_LEVEL", name=lvl_name, value=repr(lvl_value))
@@ -1487,15 +1509,36 @@ class YydsLogger:
         from .lifecycle import restore_exception_handler
         return restore_exception_handler(self)
 
+    def _uncollected_active_handlers(self):
+        return [
+            handler
+            for handler in getattr(self.logger._core, "handlers", {}).values()
+            if not getattr(handler, "_metrics_collected", False)
+        ]
+
     def get_queue_dropped(self) -> int:
         """Return records dropped by queue overflow or serialization failure."""
-        current = sum(int(getattr(handler, "dropped_messages", 0)) for handler in self._queue_handlers())
+        current = sum(
+            int(getattr(handler, "dropped_messages", 0))
+            for handler in self._uncollected_active_handlers()
+        )
         return self._dropped_messages_total + current
 
     def get_queue_serialization_errors(self) -> int:
-        """Return multiprocessing records rejected before queue insertion."""
-        current = sum(int(getattr(handler, "serialization_errors", 0)) for handler in self._queue_handlers())
+        """Return records rejected by formatting or serialization failure."""
+        current = sum(
+            int(getattr(handler, "serialization_errors", 0))
+            for handler in self._uncollected_active_handlers()
+        )
         return self._serialization_errors_total + current
+
+    def get_sink_errors(self) -> int:
+        """Return cumulative sink write or rotation errors across active and retired handlers."""
+        current = sum(
+            int(getattr(handler, "sink_errors", 0))
+            for handler in self._uncollected_active_handlers()
+        )
+        return self._sink_errors_total + current
 
     def _queue_handlers(self):
         return [
@@ -1506,7 +1549,7 @@ class YydsLogger:
 
     def _queue_drop_reasons(self) -> Dict[str, int]:
         reasons = dict(self._drop_reasons_total)
-        for handler in self._queue_handlers():
+        for handler in self._uncollected_active_handlers():
             for reason, count in getattr(handler, "drop_reasons", {}).items():
                 reasons[reason] = reasons.get(reason, 0) + int(count)
         return reasons
@@ -1544,7 +1587,7 @@ class YydsLogger:
                 "writer_alive": bool(handlers) and all(
                     bool(getattr(handler, "writer_alive", False)) for handler in handlers
                 ),
-                "sink_errors": sum(int(getattr(handler, "sink_errors", 0)) for handler in handlers),
+                "sink_errors": self.get_sink_errors(),
                 "handlers": [
                     {
                         "id": getattr(handler, "_id", None),
@@ -1595,6 +1638,33 @@ class YydsLogger:
             }
         result = checker.check_health(log_dir)
         result["logger"] = state_snapshot
+        if state_snapshot["state"] == "failed":
+            result["errors"].append(self._msg("HEALTH_LOGGER_FAILED"))
+            if result["status"] != "error":
+                result["status"] = "critical"
+        elif (
+            state_snapshot["state"] == "open"
+            and queue_status["enabled"]
+            and not state_snapshot["queue_writer_alive"]
+        ):
+            result["errors"].append(self._msg("HEALTH_WRITER_DEAD"))
+            if result["status"] != "error":
+                result["status"] = "critical"
+        if state_snapshot["queue_sink_errors"] > 0:
+            result["warnings"].append(
+                self._msg("HEALTH_SINK_ERRORS", count=state_snapshot["queue_sink_errors"])
+            )
+            if result["status"] == "healthy":
+                result["status"] = "warning"
+        if state_snapshot["pending_handler_stops"] > 0:
+            result["warnings"].append(
+                self._msg(
+                    "HEALTH_PENDING_HANDLER_STOPS",
+                    count=state_snapshot["pending_handler_stops"],
+                )
+            )
+            if result["status"] == "healthy":
+                result["status"] = "warning"
         return result
 
     def capture_std_logging(self, level: str = "DEBUG",

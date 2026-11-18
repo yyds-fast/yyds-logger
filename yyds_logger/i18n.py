@@ -59,6 +59,10 @@ LANG_MAP = {
         "HEALTH_DISK_CRITICAL": "磁盘使用率过高",
         "HEALTH_DISK_WARNING": "磁盘使用率较高",
         "HEALTH_MEMORY_WARNING": "进程内存使用量较高",
+        "HEALTH_LOGGER_FAILED": "日志记录器处于异常失败状态",
+        "HEALTH_WRITER_DEAD": "异步队列写入线程或进程已停止",
+        "HEALTH_SINK_ERRORS": "检测到日志输出错误: {count}",
+        "HEALTH_PENDING_HANDLER_STOPS": "存在尚未完成关闭的日志处理器: {count}",
     },
     "en": {
         "UNHANDLED_EXCEPTION": "Unhandled exception", "START_FUNCTION_CALL": "Starting function call",
@@ -117,6 +121,10 @@ LANG_MAP = {
         "HEALTH_DISK_CRITICAL": "Disk usage is too high",
         "HEALTH_DISK_WARNING": "Disk usage is high",
         "HEALTH_MEMORY_WARNING": "Process memory usage is high",
+        "HEALTH_LOGGER_FAILED": "Logger is in a failed cleanup state",
+        "HEALTH_WRITER_DEAD": "Asynchronous queue writer is not alive",
+        "HEALTH_SINK_ERRORS": "Detected log sink write errors: {count}",
+        "HEALTH_PENDING_HANDLER_STOPS": "Pending log handler shutdowns: {count}",
     },
 }
 

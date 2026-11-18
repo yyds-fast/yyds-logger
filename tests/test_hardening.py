@@ -2116,3 +2116,272 @@ def test_rotation_preserves_current_record_when_compression_fails(tmp_path):
     assert "second-record-survives-rotation" in active_content
     gz_files = list(tmp_path.glob("*.gz"))
     assert gz_files == []
+
+
+def test_async_sink_enqueue_complete_fast_and_strong_task_retention(tmp_path):
+    import gc
+
+    async def scenario():
+        logger = YydsLogger(
+            "async-sink-enqueue",
+            log_dir=str(tmp_path),
+            console_level="OFF",
+            compression=None,
+        )
+        received = []
+        gate = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        async def fast_sink(msg):
+            await asyncio.sleep(0.005)
+            received.append(str(msg).strip())
+
+        async def gated_sink(msg):
+            await gate.wait()
+            received.append("gated:" + str(msg).strip())
+
+        try:
+            fast_id = logger.logger.add(
+                fast_sink,
+                format="{message}",
+                enqueue=True,
+                loop=loop,
+            )
+            start = time.monotonic()
+            for idx in range(10):
+                logger.info(f"enqueued-{idx}")
+            await logger.flush_async()
+            elapsed = time.monotonic() - start
+            assert elapsed < 0.8
+            assert len(received) == 10
+            logger.logger.remove(fast_id)
+
+            gated_id = logger.logger.add(gated_sink, format="{message}", enqueue=False)
+            gated_handler = logger.logger._core.handlers[gated_id]
+            logger.info("hold-in-flight")
+            await asyncio.sleep(0)
+            gc.collect()
+            assert len(gated_handler._sink._tasks) == 1
+            gate.set()
+            await logger.flush_async()
+            assert "gated:hold-in-flight" in received
+            assert len(gated_handler._sink._tasks) == 0
+        finally:
+            await logger.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_defer_format_captures_exact_exception_locals_and_drops_live_frames(tmp_path):
+    import gc
+    import types
+    import weakref
+    from yyds_logger.yyds_loguru._file_sink import FileSink
+
+    class FramePayload:
+        pass
+
+    logger = YydsLogger(
+        "defer-exc",
+        log_dir=str(tmp_path),
+        env="dev",
+        enqueue=True,
+        defer_format=True,
+        serialize=True,
+        console_level="OFF",
+        compression=None,
+    )
+    try:
+        file_handler = next(
+            h for h in logger.logger._core.handlers.values() if isinstance(h._sink, FileSink)
+        )
+        writer_gate = threading.Event()
+        orig_write = file_handler._sink.write
+
+        def paused_write(msg):
+            writer_gate.wait(timeout=2.0)
+            return orig_write(msg)
+
+        file_handler._sink.write = paused_write
+        # Block the writer thread on a warm-up record so the subsequent
+        # DeferredMessage stays queued while we inspect frame retention.
+        logger.info("warmup-pause")
+        time.sleep(0.03)
+
+        payload_ref = None
+
+        def trigger_in_loop():
+            nonlocal payload_ref
+            for item_id in range(5):
+                if item_id == 0:
+                    local_payload = FramePayload()
+                    payload_ref = weakref.ref(local_payload)
+                    try:
+                        _ = 1 / item_id
+                    except ZeroDivisionError:
+                        logger.exception("loop-failure")
+                    del local_payload
+
+        trigger_in_loop()
+        gc.collect()
+        assert payload_ref is not None
+        assert payload_ref() is None
+
+        queued_items = list(file_handler._queue._deque)
+        deferred_items = [
+            item for item in queued_items if hasattr(item, "preformatted_exception")
+        ]
+        assert len(deferred_items) == 1
+        exc_rec = deferred_items[0].record["exception"]
+        assert exc_rec is not None
+        assert not isinstance(exc_rec.traceback, types.TracebackType)
+        assert exc_rec.traceback is True
+
+        writer_gate.set()
+        logger.flush()
+    finally:
+        logger.cleanup()
+
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "defer-exc.log").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    err_entry = next(item for item in lines if item["record"]["message"] == "loop-failure")
+    assert err_entry["record"]["exception"]["type"] == "ZeroDivisionError"
+    assert "division by zero" in err_entry["record"]["exception"]["value"]
+    assert err_entry["record"]["exception"]["traceback"] is True
+    assert "_ = 1 / item_id" in err_entry["text"]
+    assert "└ 0" in err_entry["text"]
+    assert "└ 4" not in err_entry["text"]
+
+
+def test_serialize_handles_unprintable_exception_and_extra_objects(tmp_path):
+    class BadStrError(Exception):
+        def __str__(self):
+            raise RuntimeError("broken exception __str__")
+
+    class BadStrObj:
+        def __str__(self):
+            raise RuntimeError("broken object __str__")
+
+    logger = YydsLogger(
+        "unprintable-json",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        serialize=True,
+        console_level="OFF",
+        compression=None,
+    )
+    try:
+        err = BadStrError("hidden")
+        with contextlib.redirect_stderr(io.StringIO()):
+            logger.bind(bad_obj=BadStrObj()).opt(exception=err).error("unprintable-check")
+    finally:
+        logger.cleanup()
+
+    raw = (tmp_path / "unprintable-json.log").read_text(encoding="utf-8").strip()
+    parsed = json.loads(raw)
+    assert parsed["record"]["message"] == "unprintable-check"
+    assert parsed["record"]["exception"]["type"] == "BadStrError"
+    assert "<unprintable BadStrError object>" in parsed["record"]["exception"]["value"]
+    assert "<unprintable BadStrObj object>" in parsed["record"]["extra"]["bad_obj"]
+
+
+def test_health_and_metrics_track_sink_errors_and_sync_format_drops_across_reconfigure(tmp_path):
+    logger = YydsLogger(
+        "health-metrics",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="OFF",
+        language="en",
+        compression=None,
+    )
+    try:
+        def bad_formatter(record):
+            raise KeyError("boom_dynamic_format")
+
+        bad_fmt_id = logger.logger.add(
+            lambda m: None,
+            format=bad_formatter,
+            enqueue=False,
+            catch=True,
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            logger.info("triggers-sync-format-error")
+        assert logger.get_queue_dropped() >= 1
+        assert logger.get_queue_serialization_errors() >= 1
+        assert logger.get_queue_status()["drop_reasons"]["serialization"] >= 1
+        logger.logger.remove(bad_fmt_id)
+
+        def broken_sink(msg):
+            raise OSError("disk I/O write failure")
+
+        broken_id = logger.logger.add(broken_sink, enqueue=False, catch=True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            logger.error("triggers-sink-error")
+        assert logger.get_sink_errors() == 1
+        health_warn = logger.get_health()
+        assert health_warn["status"] == "warning"
+        assert any("sink write errors: 1" in w for w in health_warn["warnings"])
+
+        logger.logger.remove(broken_id)
+        logger.reconfigure(enqueue=True, file_level="DEBUG")
+        file_handler = logger.logger._core.handlers[logger._handler_ids[-1]]
+        file_handler._sink_errors = 2
+        assert logger.get_sink_errors() == 2
+        logger.reconfigure(file_level="INFO")
+        assert logger.get_sink_errors() == 2
+        health_after_reconfig = logger.get_health()
+        assert health_after_reconfig["status"] == "warning"
+
+        # Simulate dead writer thread on active enqueued handler -> critical health.
+        active_qh = logger._queue_handlers()[0]
+        orig_thread = active_qh._thread
+        active_qh._thread = None
+        try:
+            health_crit = logger.get_health()
+            assert health_crit["status"] == "critical"
+            assert any("writer is not alive" in e for e in health_crit["errors"])
+        finally:
+            active_qh._thread = orig_thread
+    finally:
+        logger.cleanup()
+
+
+def test_console_level_off_or_false_skips_console_handler_and_validates_strictly(tmp_path):
+    from yyds_logger.yyds_loguru._colorizer import ColoringMessage
+
+    cm = ColoringMessage("hello")
+    assert not hasattr(cm, "__dict__")
+
+    stderr_buf = io.StringIO()
+    with contextlib.redirect_stderr(stderr_buf):
+        logger = YydsLogger(
+            "headless-console",
+            log_dir=str(tmp_path),
+            enqueue=False,
+            console_level="off",
+            compression=None,
+        )
+        try:
+            assert len(logger._handler_ids) == 1
+            logger.error("only-in-file")
+            assert stderr_buf.getvalue() == ""
+
+            logger.reconfigure(console_level="INFO")
+            assert len(logger._handler_ids) == 2
+
+            logger.reconfigure(console_level=False)
+            assert len(logger._handler_ids) == 1
+
+            with pytest.raises(ValueError):
+                logger.reconfigure(console_level=True)
+            with pytest.raises(ValueError):
+                logger.reconfigure(file_level="OFF")
+            with pytest.raises(ValueError):
+                logger.reconfigure(file_level=False)
+        finally:
+            logger.cleanup()
+
+    assert "only-in-file" in (tmp_path / "headless-console.log").read_text(encoding="utf-8")

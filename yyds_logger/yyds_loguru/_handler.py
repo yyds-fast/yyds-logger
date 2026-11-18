@@ -13,6 +13,7 @@ from time import monotonic
 
 from ._colorizer import Colorizer
 from ._locks_machinery import create_handler_lock
+from ._recattrs import RecordException
 
 _FLUSH_MARKER = "__loguru_flush__"
 _PICKLED_MARKER = "__loguru_pickled__"
@@ -144,6 +145,13 @@ def memoize(function):
     return functools.lru_cache(maxsize=64)(function)
 
 
+def _safe_json_default(obj):
+    try:
+        return str(obj)
+    except Exception:
+        return "<unprintable %s object>" % type(obj).__name__
+
+
 class Message(str):
     __slots__ = ("record",)
 
@@ -153,18 +161,34 @@ class DeferredMessage:
 
     This is intentionally only used with the in-process thread queue.  Keeping
     the record and the pre-parsed color message together preserves the normal
-    Loguru semantics while moving the expensive format/JSON/exception work out
-    of the caller's logging thread.
+    Loguru semantics while moving the expensive format/JSON work out of the
+    caller's logging thread.
     """
 
-    __slots__ = ("record", "level_id", "from_decorator", "is_raw", "colored_message")
+    __slots__ = (
+        "record",
+        "level_id",
+        "from_decorator",
+        "is_raw",
+        "colored_message",
+        "preformatted_exception",
+    )
 
-    def __init__(self, record, level_id, from_decorator, is_raw, colored_message):
+    def __init__(
+        self,
+        record,
+        level_id,
+        from_decorator,
+        is_raw,
+        colored_message,
+        preformatted_exception=None,
+    ):
         self.record = record
         self.level_id = level_id
         self.from_decorator = from_decorator
         self.is_raw = is_raw
         self.colored_message = colored_message
+        self.preformatted_exception = preformatted_exception
 
 
 _DEFAULT_TIMEOUT = object()
@@ -357,21 +381,45 @@ class Handler:
                 # caller retaining a patcher reference cannot change which
                 # keys the writer observes after this emit returns.
                 queued_record["extra"] = record["extra"].copy()
+                preformatted_exception = None
+                if record["exception"] is not None:
+                    type_, value, tb = record["exception"]
+                    try:
+                        lines = self._exception_formatter.format_exception(
+                            type_, value, tb, from_decorator=from_decorator
+                        )
+                        preformatted_exception = "".join(lines)
+                    except Exception:
+                        self._record_drop("serialization")
+                        raise
+                    # Drop the live traceback frame graph (including
+                    # ``value.__traceback__``) after capturing exact
+                    # caller-thread locals/line numbers, while preserving
+                    # serialized JSON fields.
+                    value_text = None if value is None else _safe_json_default(value)
+                    queued_record["exception"] = RecordException(
+                        type_, value_text, True if tb is not None else None
+                    )
                 queued_message = DeferredMessage(
                     queued_record,
                     level_id,
                     from_decorator,
                     is_raw,
                     colored_message,
+                    preformatted_exception,
                 )
             else:
-                queued_message = self._format_message(
-                    record,
-                    level_id,
-                    from_decorator,
-                    is_raw,
-                    colored_message,
-                )
+                try:
+                    queued_message = self._format_message(
+                        record,
+                        level_id,
+                        from_decorator,
+                        is_raw,
+                        colored_message,
+                    )
+                except Exception:
+                    self._record_drop("serialization")
+                    raise
 
             self._enqueue_or_write(queued_message, record)
         except Exception as exc:
@@ -380,13 +428,23 @@ class Handler:
                 raise
             self._error_interceptor.print(record)
 
-    def _format_message(self, record, level_id, from_decorator, is_raw, colored_message=None):
+    def _format_message(
+        self,
+        record,
+        level_id,
+        from_decorator,
+        is_raw,
+        colored_message=None,
+        preformatted_exception=None,
+    ):
         if self._is_formatter_dynamic:
             dynamic_format = self._formatter(record)
 
         formatter_record = record.copy()
 
-        if not record["exception"]:
+        if preformatted_exception is not None:
+            formatter_record["exception"] = preformatted_exception
+        elif not record["exception"]:
             formatter_record["exception"] = ""
         else:
             type_, value, tb = record["exception"]
@@ -851,7 +909,7 @@ class Handler:
             },
         }
 
-        return json.dumps(serializable, default=str, ensure_ascii=False) + "\n"
+        return json.dumps(serializable, default=_safe_json_default, ensure_ascii=False) + "\n"
 
     def _flush_pending_writes(self, lock, pending_writes):
         if not pending_writes:
@@ -929,10 +987,12 @@ class Handler:
                 ):
                     try:
                         message = ForkingPickler.loads(message[1])
-                    except Exception:
+                    except Exception as exc:
+                        self._record_drop("serialization")
+                        self._last_error = exc
                         self._flush_pending_writes(lock, pending_writes)
                         with lock:
-                            self._error_interceptor.print(None)
+                            self._error_interceptor.print(None, exception=exc)
                         continue
 
                 if message is None:
@@ -962,6 +1022,7 @@ class Handler:
                             message.from_decorator,
                             message.is_raw,
                             message.colored_message,
+                            message.preformatted_exception,
                         )
                     except Exception as exc:
                         self._record_drop("serialization")

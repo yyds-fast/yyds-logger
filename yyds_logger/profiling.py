@@ -7,6 +7,7 @@ import sys
 import threading
 from collections import defaultdict
 from time import perf_counter
+from typing import Any, Dict, List
 
 
 _TRACE_STATE = threading.local()
@@ -78,10 +79,13 @@ def run_sync(logger, func, *args, **kwargs):
         print_report(logger, profile_target, duration_ms, {}, {})
         return result
 
+    LineProfiler: Any = None
     try:
-        from line_profiler import LineProfiler  # type: ignore
+        from line_profiler import LineProfiler as _LineProfiler  # type: ignore
+
+        LineProfiler = _LineProfiler
     except ImportError:
-        LineProfiler = None
+        pass
     if LineProfiler is not None:
         profiler = LineProfiler()
         _enter_trace(target_code, task=None)
@@ -137,10 +141,13 @@ async def _run_async(logger, func, *args, **kwargs):
         print_report(logger, profile_target, duration_ms, {}, {})
         return result
 
+    LineProfiler: Any = None
     try:
-        from line_profiler import LineProfiler  # type: ignore
+        from line_profiler import LineProfiler as _LineProfiler  # type: ignore
+
+        LineProfiler = _LineProfiler
     except ImportError:
-        LineProfiler = None
+        pass
 
     if LineProfiler is not None:
         profiler = LineProfiler()
@@ -195,9 +202,9 @@ def _extract_stats(stats, func):
 
 
 def _build_line_tracer(target_code):
-    line_times = defaultdict(float)
-    line_hits = defaultdict(int)
-    frame_states = {}
+    line_times: Dict[int, float] = defaultdict(float)
+    line_hits: Dict[int, int] = defaultdict(int)
+    frame_states: Dict[Any, List[Any]] = {}
 
     def local_tracer(frame, event, arg):
         if event == "line":
@@ -288,7 +295,7 @@ def print_report(logger, func, total_duration_ms, line_times, line_hits):
         line_no = start_line + index
         milliseconds = line_times.get(line_no, 0.0) * 1000.0
         percentages[line_no] = milliseconds / total_duration_ms * 100.0 if total_duration_ms else 0.0
-    slowest_line = max(percentages, key=percentages.get, default=None)
+    slowest_line = max(percentages, key=lambda ln: percentages[ln], default=None)
     for index, source in enumerate(lines):
         line_no = start_line + index
         hits = line_hits.get(line_no, 0)

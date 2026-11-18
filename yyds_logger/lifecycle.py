@@ -91,10 +91,11 @@ def setup_exception_handler(logger) -> None:
                 if callable(previous_threading_hook)
                 else default_threading_hook
             )
-            try:
-                previous(args)
-            except Exception:
-                pass
+            if callable(previous):
+                try:
+                    previous(args)
+                except Exception:
+                    pass
             return
         owner = logger_ref()
         if owner is not None and getattr(owner, "_cleanup_state", "open") == "open":
@@ -117,7 +118,10 @@ def setup_exception_handler(logger) -> None:
     except Exception:
         if sys.excepthook is exception_handler:
             sys.excepthook = previous_excepthook
-        if getattr(threading, "excepthook", None) is thread_excepthook:
+        if (
+            getattr(threading, "excepthook", None) is thread_excepthook
+            and previous_threading_hook is not None
+        ):
             threading.excepthook = previous_threading_hook
         logger._release_global_resource("exception_hooks")
         raise

@@ -25,16 +25,17 @@ def _loguru_datetime_formatter(is_utc, format_string, formatters, dt):
     return format_string % args
 
 
+_LAST_DT_KEY = None
+_LAST_DT_PREFIX = ""
+
+
 def _default_datetime_formatter(dt):
-    return "%04d-%02d-%02d %02d:%02d:%02d.%03d" % (
-        dt.year,
-        dt.month,
-        dt.day,
-        dt.hour,
-        dt.minute,
-        dt.second,
-        dt.microsecond // 1000,
-    )
+    global _LAST_DT_KEY, _LAST_DT_PREFIX
+    key = (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+    if key != _LAST_DT_KEY:
+        _LAST_DT_PREFIX = "%04d-%02d-%02d %02d:%02d:%02d." % key
+        _LAST_DT_KEY = key
+    return "%s%03d" % (_LAST_DT_PREFIX, dt.microsecond // 1000)
 
 
 def _short_datetime_formatter(dt):

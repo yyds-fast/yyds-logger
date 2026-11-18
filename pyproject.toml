@@ -71,7 +71,7 @@ target-version = "py39"
 select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 check_untyped_defs = true
 ignore_missing_imports = true
 exclude = "^yyds_logger/yyds_loguru/"
@@ -79,9 +79,6 @@ exclude = "^yyds_logger/yyds_loguru/"
 [[tool.mypy.overrides]]
 module = [
   "yyds_logger.yyds_loguru.*",
-  "yyds_logger.lifecycle",
-  "yyds_logger.profiling",
-  "yyds_logger.stdlib_bridge",
 ]
 ignore_errors = true
 follow_imports = "skip"

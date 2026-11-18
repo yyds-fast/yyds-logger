@@ -1,7 +1,7 @@
+import asyncio
 import inspect
 import logging
 import threading
-import weakref
 
 from ._asyncio_loop import get_running_loop, get_task_loop
 
@@ -64,21 +64,41 @@ class AsyncSink:
         self._function = function
         self._loop = loop
         self._error_interceptor = error_interceptor
-        self._tasks = weakref.WeakSet()
+        self._lock = threading.Lock()
+        self._tasks = set()
+        self._pending_by_loop = {}
+        self._stopped = False
+
+    def _decrement_pending(self, loop):
+        remaining = self._pending_by_loop.get(loop, 0) - 1
+        if remaining > 0:
+            self._pending_by_loop[loop] = remaining
+        else:
+            self._pending_by_loop.pop(loop, None)
 
     def _schedule_task(self, loop, message):
+        with self._lock:
+            if self._stopped:
+                return None
         coroutine = self._function(message)
-        task = loop.create_task(coroutine)
+        try:
+            task = loop.create_task(coroutine)
+        except BaseException:
+            coroutine.close()
+            raise
 
         def check_exception(future):
+            with self._lock:
+                self._tasks.discard(future)
             if future.cancelled() or future.exception() is None:
                 return
             if not self._error_interceptor.should_catch():
                 raise future.exception()
             self._error_interceptor.print(message.record, exception=future.exception())
 
+        with self._lock:
+            self._tasks.add(task)
         task.add_done_callback(check_exception)
-        self._tasks.add(task)
         return task
 
     def write(self, message):
@@ -99,24 +119,29 @@ class AsyncSink:
         if loop.is_closed():
             return
 
-        done = threading.Event()
-
         def schedule_on_loop():
             try:
                 if not loop.is_closed():
                     self._schedule_task(loop, message)
             finally:
-                done.set()
+                with self._lock:
+                    self._decrement_pending(loop)
 
-        try:
-            loop.call_soon_threadsafe(schedule_on_loop)
-        except RuntimeError:
-            return
-        if loop.is_running():
-            done.wait(timeout=1.0)
+        with self._lock:
+            if self._stopped or loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(schedule_on_loop)
+            except RuntimeError:
+                return
+            self._pending_by_loop[loop] = self._pending_by_loop.get(loop, 0) + 1
 
     def stop(self):
-        for task in self._tasks:
+        with self._lock:
+            self._stopped = True
+            self._pending_by_loop.clear()
+            tasks = list(self._tasks)
+        for task in tasks:
             if task.done():
                 continue
             loop = get_task_loop(task)
@@ -135,39 +160,55 @@ class AsyncSink:
                 pass
 
     def tasks_to_complete(self):
-        # To avoid errors due to "self._tasks" being mutated while iterated, the
-        # "tasks_to_complete()" method must be protected by the same lock as "write()" (which
-        # happens to be the handler lock). However, the tasks must not be awaited while the lock is
-        # acquired as this could lead to a deadlock. Therefore, we first need to collect the tasks
-        # to complete, then return them so that they can be awaited outside of the lock.
-        return [self._complete_task(task) for task in self._tasks]
-
-    async def _complete_task(self, task):
-        loop = get_running_loop()
-        if get_task_loop(task) is not loop:
-            return
-        if task.cancelled():
-            # A previous bounded completion may have cancelled this sink task
-            # and retained it briefly (Python 3.12+ does this while the
-            # waiter's traceback is alive).  It is already terminal, so a
-            # later cleanup retry should treat it as completed.  Keep this
-            # check outside the await: cancellation of the *current* waiter
-            # must still propagate so ``asyncio.wait_for()`` reports its
-            # timeout correctly.
-            return
         try:
-            await task
-        except Exception:
-            pass  # Handled in "check_exception()"
+            running_loop = get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        with self._lock:
+            if running_loop is not None:
+                if self._loop is not None and self._loop is not running_loop:
+                    return []
+                has_loop_work = self._pending_by_loop.get(running_loop, 0) > 0 or any(
+                    get_task_loop(task) is running_loop for task in self._tasks
+                )
+                if not has_loop_work:
+                    return []
+            elif not self._tasks and not self._pending_by_loop:
+                return []
+        return [self._complete_pending()]
+
+    async def _complete_pending(self):
+        loop = get_running_loop()
+        if self._loop is not None and self._loop is not loop:
+            return
+        while True:
+            with self._lock:
+                pending = self._pending_by_loop.get(loop, 0)
+            if pending <= 0 or loop.is_closed():
+                break
+            await asyncio.sleep(0)
+        with self._lock:
+            tasks = [task for task in self._tasks if get_task_loop(task) is loop]
+        for task in tasks:
+            if task.cancelled():
+                continue
+            try:
+                await task
+            except Exception:
+                pass  # Handled in "check_exception()"
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_tasks"] = None
+        state["_lock"] = None
+        state["_pending_by_loop"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        self._tasks = weakref.WeakSet()
+        self._tasks = set()
+        self._lock = threading.Lock()
+        self._pending_by_loop = {}
 
 
 class CallableSink:

@@ -130,12 +130,13 @@ context = ContextVar("loguru_context", default={})
 @functools.lru_cache(maxsize=512)
 def _get_file_and_module(co_filename):
     file_name = basename(co_filename)
-    return file_name, splitext(file_name)[0]
+    return RecordFile(file_name, co_filename), splitext(file_name)[0]
 
 
 _CACHED_PID = os.getpid()
 _CACHED_PROCESS_NAME = None
 _CACHED_RECORD_PROCESS = None
+_THREAD_RECORD_LOCAL = threading.local()
 
 
 def _refresh_fork_pid():
@@ -2079,8 +2080,9 @@ class Logger:
 
         current_datetime = aware_now()
 
-        file_name, module_name = _get_file_and_module(co_filename)
+        record_file, module_name = _get_file_and_module(co_filename)
         thread = current_thread()
+        t_name = thread.name
         process = current_process()
         proc_name = process.name
         global _CACHED_PID, _CACHED_PROCESS_NAME, _CACHED_RECORD_PROCESS
@@ -2090,6 +2092,12 @@ class Logger:
             _CACHED_PROCESS_NAME = proc_name
             record_process = RecordProcess(_CACHED_PID, proc_name)
             _CACHED_RECORD_PROCESS = record_process
+        cached_thread = getattr(_THREAD_RECORD_LOCAL, "entry", None)
+        if cached_thread is None or cached_thread[0] != _CACHED_PID or cached_thread[1] != t_name:
+            record_thread = RecordThread(thread.ident, t_name)
+            _THREAD_RECORD_LOCAL.entry = (_CACHED_PID, t_name, record_thread)
+        else:
+            record_thread = cached_thread[2]
         elapsed = current_datetime - start_time
 
         if exception:
@@ -2103,11 +2111,17 @@ class Logger:
         else:
             exception = None
 
+        ctx_dict = core.context.get()
+        if not core.extra and not ctx_dict and not extra:
+            record_extra = {}
+        else:
+            record_extra = {**core.extra, **ctx_dict, **extra}
+
         log_record = {
             "elapsed": elapsed,
             "exception": exception,
-            "extra": {**core.extra, **core.context.get(), **extra},
-            "file": RecordFile(file_name, co_filename),
+            "extra": record_extra,
+            "file": record_file,
             "function": co_name,
             "level": record_level,
             "line": f_lineno,
@@ -2115,7 +2129,7 @@ class Logger:
             "module": module_name,
             "name": name,
             "process": record_process,
-            "thread": RecordThread(thread.ident, thread.name),
+            "thread": record_thread,
             "time": current_datetime,
         }
 
@@ -2153,7 +2167,8 @@ class Logger:
             patcher(log_record)
 
         for handler in core.handlers.values():
-            handler.emit(log_record, level_id, from_decorator, raw, colored_message)
+            if handler._levelno <= level_no:
+                handler.emit(log_record, level_id, from_decorator, raw, colored_message)
 
     def trace(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'TRACE'``."""
