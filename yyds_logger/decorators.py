@@ -23,7 +23,7 @@ def log_decorator(logger, msg=None, level="ERROR", trace=True, reraise=True):
     """
     def decorator(func):
         msg_key = msg or "UNHANDLED_EXCEPTION"
-        log_level = str(level)
+        log_level = level
         func_name = _callable_name(func)
         if _is_async_callable(func):
             @wraps(func)

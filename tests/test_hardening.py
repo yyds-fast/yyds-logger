@@ -2385,3 +2385,187 @@ def test_console_level_off_or_false_skips_console_handler_and_validates_strictly
             logger.cleanup()
 
     assert "only-in-file" in (tmp_path / "headless-console.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork only")
+def test_fork_and_multiprocessing_child_get_health_does_not_false_alarm(tmp_path):
+    import pickle
+
+    lg_thread = YydsLogger(
+        "fork-health-thread",
+        log_dir=str(tmp_path),
+        console_level="OFF",
+        language="en",
+        compression=None,
+    )
+    lg_mp = YydsLogger(
+        "fork-health-mp",
+        log_dir=str(tmp_path),
+        enqueue=True,
+        queue_backend="multiprocessing",
+        console_level="OFF",
+        language="en",
+        compression=None,
+    )
+    try:
+        with pytest.raises(TypeError, match="queue_backend='multiprocessing'"):
+            pickle.dumps(lg_thread.logger)
+
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r_fd)
+            h_before = lg_thread.get_health()
+            lg_thread.info("wake-child-writer")
+            lg_thread.flush()
+            h_after = lg_thread.get_health()
+            h_mp = lg_mp.get_health()
+            payload = json.dumps(
+                {
+                    "before": h_before["status"],
+                    "before_errors": h_before["errors"],
+                    "after": h_after["status"],
+                    "mp": h_mp["status"],
+                    "mp_errors": h_mp["errors"],
+                }
+            ).encode("utf-8")
+            os.write(w_fd, payload)
+            os.close(w_fd)
+            os._exit(0)
+
+        os.close(w_fd)
+        raw = os.read(r_fd, 8192)
+        os.close(r_fd)
+        _, wait_status = os.waitpid(pid, 0)
+        assert wait_status == 0
+        report = json.loads(raw.decode("utf-8"))
+        assert report["before"] == "healthy", report
+        assert report["after"] == "healthy", report
+        assert report["mp"] == "healthy", report
+    finally:
+        lg_mp.cleanup()
+        lg_thread.cleanup()
+
+
+def test_log_decorator_and_log_method_normalize_levels_and_survive_unprintable_errors(tmp_path):
+    class UnprintableBoom(Exception):
+        def __str__(self):
+            raise RuntimeError("broken __str__")
+
+    logger = YydsLogger(
+        "decorator-levels",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="OFF",
+        language="en",
+        compression=None,
+    )
+    try:
+        logger.log("info", "lowercase-info-works")
+        logger.log(" warning ", "padded-warning-works")
+        with pytest.raises(TypeError):
+            logger.log(True, "bool-rejected")  # type: ignore[arg-type]
+
+        @logger.log_decorator(level=logging.WARNING, reraise=False, trace=False)
+        def fail_int():
+            raise ValueError("int-level-boom")
+
+        @logger.log_decorator(level=" warning ", reraise=False, trace=False)
+        def fail_padded():
+            raise UnprintableBoom("hidden")
+
+        fail_int()
+        fail_padded()
+    finally:
+        logger.cleanup()
+
+    content = (tmp_path / "decorator-levels.log").read_text(encoding="utf-8")
+    assert "INFO     |" in content and "lowercase-info-works" in content
+    assert "padded-warning-works" in content
+    assert "WARNING  |" in content and "int-level-boom" in content
+    assert "<unprintable UnprintableBoom object>" in content
+    assert "Error occurred while logging exception" not in content
+
+
+def test_stdlib_bridge_honors_stacklevel_and_replayed_log_records(tmp_path):
+    logger = YydsLogger(
+        "stdlib-stacklevel",
+        log_dir=str(tmp_path),
+        enqueue=False,
+        console_level="OFF",
+        compression=None,
+    )
+    svc_name = f"stdlib.stacklevel.{id(tmp_path)}"
+    std_logger = logging.getLogger(svc_name)
+    try:
+        logger.capture_std_logging(names=[svc_name], level="INFO")
+
+        def wrapper_helper(msg):
+            std_logger.warning(msg, stacklevel=2)
+
+        expected_caller_line = None
+
+        def real_caller():
+            nonlocal expected_caller_line
+            expected_caller_line = inspect.currentframe().f_lineno + 1
+            wrapper_helper("stacklevel-two-msg")
+
+        import inspect
+        real_caller()
+
+        replayed = logging.makeLogRecord(
+            {
+                "name": svc_name,
+                "levelno": logging.ERROR,
+                "levelname": "ERROR",
+                "pathname": "/srv/remote_worker/job.py",
+                "filename": "job.py",
+                "module": "job",
+                "lineno": 777,
+                "funcName": "run_job",
+                "msg": "replayed-from-queue-listener",
+                "args": (),
+            }
+        )
+        std_logger.handle(replayed)
+    finally:
+        logger.cleanup()
+
+    content = (tmp_path / "stdlib-stacklevel.log").read_text(encoding="utf-8")
+    assert f"test_hardening.py:{expected_caller_line}" in content
+    assert "job.py:777" in content
+    assert "replayed-from-queue-listener" in content
+
+
+def test_exception_formatter_tuple_none_value_and_12h_parse_time(tmp_path):
+    import datetime as dt
+    from yyds_logger.yyds_loguru._string_parsers import parse_time
+
+    assert parse_time("10:30 PM") == dt.time(22, 30)
+    assert parse_time("02:15 am") == dt.time(2, 15)
+
+    class BadAssertionError(AssertionError):
+        def __str__(self):
+            raise RuntimeError("cannot stringify assertion")
+
+    logger = YydsLogger(
+        "exc-tuple-none",
+        log_dir=str(tmp_path),
+        env="dev",
+        enqueue=False,
+        console_level="OFF",
+        compression=None,
+    )
+    try:
+        logger.logger.opt(exception=(ValueError, None, None)).error("valueless-tuple")
+        try:
+            raise BadAssertionError("bad")
+        except BadAssertionError:
+            logger.exception("bad-assertion-check")
+    finally:
+        logger.cleanup()
+
+    content = (tmp_path / "exc-tuple-none.log").read_text(encoding="utf-8")
+    assert "valueless-tuple\nValueError\n" in content
+    assert "NoneType: None" not in content
+    assert "bad-assertion-check" in content

@@ -1667,7 +1667,7 @@ class YydsLogger:
                 result["status"] = "warning"
         return result
 
-    def capture_std_logging(self, level: str = "DEBUG",
+    def capture_std_logging(self, level: Union[str, int] = "DEBUG",
                             names: Optional[List[str]] = None,
                             clear_existing: bool = False) -> None:
         """接管标准库 logging，把三方库（uvicorn/sqlalchemy/requests 等）日志统一汇入本管道。
@@ -1759,9 +1759,26 @@ class YydsLogger:
             self._level_no_cache.clear()
         return result
 
-    def log(self, level: str, message: str, *args: Any, **kwargs: Any) -> None:
+    def _normalize_log_level_arg(self, level: Any) -> Any:
+        if isinstance(level, bool):
+            raise TypeError(
+                "Invalid level, it should be an integer or a string, not: 'bool'"
+            )
+        if isinstance(level, str):
+            raw_lookup = self.logger._core.levels_lookup
+            if level in raw_lookup:
+                return level
+            stripped = level.strip()
+            if stripped in raw_lookup:
+                return stripped
+            upper = stripped.upper()
+            if upper in raw_lookup:
+                return upper
+        return level
+
+    def log(self, level: Union[str, int], message: str, *args: Any, **kwargs: Any) -> None:
         self._ensure_open()
-        return self._logger_d1.log(level, message, *args, **kwargs)
+        return self._logger_d1.log(self._normalize_log_level_arg(level), message, *args, **kwargs)
 
     def debug(self, message: str, *args: Any, **kwargs: Any) -> None:
         self._ensure_open()
@@ -1795,7 +1812,7 @@ class YydsLogger:
         self._ensure_open()
         return self._logger_d1.trace(message, *args, **kwargs)
 
-    def log_decorator(self, msg: Any = None, level: str = "ERROR", trace: bool = True,
+    def log_decorator(self, msg: Any = None, level: Union[str, int] = "ERROR", trace: bool = True,
                       reraise: bool = True) -> Any:
         from .decorators import log_decorator
         return log_decorator(self, msg=msg, level=level, trace=trace, reraise=reraise)
@@ -1814,7 +1831,7 @@ class YydsLogger:
         return await run_async(self, func, *args, **kwargs)
 
     def _log_exception(self, func_name: str, error: Exception, msg_key: str,
-                     level: str, trace: bool, is_async: bool):
+                     level: Any, trace: bool, is_async: bool):
         """统一的异常记录处理，增强错误信息显示"""
         if getattr(self, "_cleanup_state", "open") != "open":
             return
@@ -1830,7 +1847,13 @@ class YydsLogger:
 
             # 安全地格式化错误信息
             error_type = type(error).__name__
-            error_value = str(error) if error is not None else "None"
+            if error is None:
+                error_value = "None"
+            else:
+                try:
+                    error_value = str(error)
+                except Exception:
+                    error_value = f"<unprintable {error_type} object>"
 
             # 获取错误发生的具体位置
             if tb:
@@ -1850,7 +1873,7 @@ class YydsLogger:
             )
 
             if level_no is not None:
-                d2.log(level if level in self.logger._core.levels_lookup else level.upper(), full_error_msg)
+                d2.log(self._normalize_log_level_arg(level), full_error_msg)
             else:
                 d2.error(full_error_msg)
 

@@ -44,6 +44,12 @@ class _ThreadQueue:
         with self._mutex:
             return len(self._deque)
 
+    def __getstate__(self):
+        raise TypeError(
+            "Cannot pickle an in-process thread queue (queue_backend='thread'); "
+            "use queue_backend='multiprocessing' to share a logger across spawned processes."
+        )
+
     def put_log(self, item, block=True, timeout=None):
         """Enqueue a log message unless the queue is already stopped."""
         with self._mutex:
@@ -296,16 +302,16 @@ class Handler:
         self._queue_join_started = False
         self._queue_join_event = threading.Event()
         self._queue_join_error = None
-        self._queue_join_lock = threading.Lock()
+        self._queue_join_lock = create_handler_lock()
         self._queue_closed = False
         self._sink_stop_started = False
         self._sink_stop_event = threading.Event()
         self._sink_stop_error = None
-        self._sink_stop_lock = threading.Lock()
+        self._sink_stop_lock = create_handler_lock()
         self._last_error = None
-        self._flush_state_lock = threading.Lock()
+        self._flush_state_lock = create_handler_lock()
         self._flush_seq = 0
-        self._enqueue_state_lock = threading.Lock()
+        self._enqueue_state_lock = create_handler_lock()
         self._enqueue_drained_cond = threading.Condition(self._enqueue_state_lock)
         self._active_enqueues = 0
 
@@ -513,19 +519,19 @@ class Handler:
             self._queue = _ThreadQueue(maxsize=self._queue_size or 0)
             self._confirmation_event = threading.Event()
             self._confirmation_lock = threading.Lock()
-            self._flush_state_lock = threading.Lock()
+            self._flush_state_lock = create_handler_lock()
             self._flush_seq = 0
             self._queue_stop_sent = False
             self._queue_close_called = False
             self._queue_join_started = False
             self._queue_join_event = threading.Event()
             self._queue_join_error = None
-            self._queue_join_lock = threading.Lock()
+            self._queue_join_lock = create_handler_lock()
             self._queue_closed = False
             self._sink_stop_started = False
             self._sink_stop_event = threading.Event()
             self._sink_stop_error = None
-            self._sink_stop_lock = threading.Lock()
+            self._sink_stop_lock = create_handler_lock()
             self._owner_process_pid = os.getpid()
             self._thread = Thread(
                 target=self._queued_writer, daemon=True, name="loguru-writer-%d" % self._id
@@ -856,6 +862,10 @@ class Handler:
 
     @property
     def writer_alive(self):
+        if not self._enqueue or self._stopped:
+            return False
+        if self._owner_process_pid != os.getpid():
+            return not self._queue_closed
         return bool(self._thread is not None and self._thread.is_alive())
 
     @property
@@ -1068,14 +1078,14 @@ class Handler:
         self._lock = create_handler_lock()
         self._lock_acquired = threading.local()
         self._counter_lock = create_handler_lock()
-        self._flush_state_lock = threading.Lock()
-        self._enqueue_state_lock = threading.Lock()
+        self._flush_state_lock = create_handler_lock()
+        self._enqueue_state_lock = create_handler_lock()
         self._enqueue_drained_cond = threading.Condition(self._enqueue_state_lock)
         self._active_enqueues = 0
         self._queue_join_event = threading.Event()
-        self._queue_join_lock = threading.Lock()
+        self._queue_join_lock = create_handler_lock()
         self._sink_stop_event = threading.Event()
-        self._sink_stop_lock = threading.Lock()
+        self._sink_stop_lock = create_handler_lock()
         if self._enqueue:
             self._queue_lock = create_handler_lock()
         if self._is_formatter_dynamic:

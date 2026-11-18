@@ -1,9 +1,9 @@
 import asyncio
 import inspect
 import logging
-import threading
 
 from ._asyncio_loop import get_running_loop, get_task_loop
+from ._locks_machinery import create_handler_lock
 
 
 class StreamSink:
@@ -64,7 +64,7 @@ class AsyncSink:
         self._function = function
         self._loop = loop
         self._error_interceptor = error_interceptor
-        self._lock = threading.Lock()
+        self._lock = create_handler_lock()
         self._tasks = set()
         self._pending_by_loop = {}
         self._stopped = False
@@ -207,7 +207,7 @@ class AsyncSink:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._tasks = set()
-        self._lock = threading.Lock()
+        self._lock = create_handler_lock()
         self._pending_by_loop = {}
 
 

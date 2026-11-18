@@ -50,7 +50,13 @@ def setup_exception_handler(logger) -> None:
         try:
             tb = traceback.extract_tb(exc_traceback)
             error_msg = owner._msg("UNHANDLED_EXCEPTION")
-            exc_value_str = str(exc_value) if exc_value is not None else "None"
+            if exc_value is None:
+                exc_value_str = "None"
+            else:
+                try:
+                    exc_value_str = str(exc_value)
+                except Exception:
+                    exc_value_str = f"<unprintable {type(exc_value).__name__} object>"
             if tb:
                 last_frame = tb[-1]
                 error_location = f"{last_frame.filename}:{last_frame.lineno}:{last_frame.name}"

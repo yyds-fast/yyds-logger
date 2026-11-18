@@ -142,7 +142,7 @@ def parse_time(time):
         "%H:%M:%S",
         "%H:%M:%S.%f",
         "%I %p",
-        "%I:%M %S",
+        "%I:%M %p",
         "%I:%M:%S %p",
         "%I:%M:%S.%f %p",
     ]

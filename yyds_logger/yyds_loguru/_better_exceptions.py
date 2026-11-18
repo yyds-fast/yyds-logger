@@ -387,11 +387,21 @@ class ExceptionFormatter:
             yield frame
 
     def _format_exception(
-        self, value, tb, *, seen=None, is_first=False, from_decorator=False, group_nesting=0
+        self,
+        value,
+        tb,
+        *,
+        exc_type=None,
+        seen=None,
+        is_first=False,
+        from_decorator=False,
+        group_nesting=0,
     ):
         # Implemented from built-in traceback module:
         # https://github.com/python/cpython/blob/a5b76167/Lib/traceback.py#L468
-        exc_type, exc_value, exc_traceback = type(value), value, tb
+        if exc_type is None:
+            exc_type = type(value)
+        exc_value, exc_traceback = value, tb
 
         if seen is None:
             seen = set()
@@ -454,7 +464,17 @@ class ExceptionFormatter:
         frames, final_source = self._extract_frames(
             exc_traceback, is_first, limit=traceback_limit, from_decorator=from_decorator
         )
-        exception_only = traceback.format_exception_only(exc_type, exc_value)
+        if exc_value is None and exc_type is not None and exc_type is not type(None):
+            module = getattr(exc_type, "__module__", None)
+            qualname = getattr(
+                exc_type, "__qualname__", getattr(exc_type, "__name__", str(exc_type))
+            )
+            if module not in (None, "builtins", "__main__"):
+                exception_only = ["%s.%s\n" % (module, qualname)]
+            else:
+                exception_only = ["%s\n" % qualname]
+        else:
+            exception_only = traceback.format_exception_only(exc_type, exc_value)
 
         # Determining the correct index for the "Exception: message" part in the formatted exception
         # is challenging. This is because it might be preceded by multiple lines specific to
@@ -479,10 +499,15 @@ class ExceptionFormatter:
                     error_message = self._theme["exception_type"].format(error_message)
 
             if self._diagnose and frames:
-                if issubclass(exc_type, AssertionError) and not str(exc_value) and final_source:
-                    if self._colorize:
-                        final_source = self._syntax_highlighter.highlight(final_source)
-                    error_message += ": " + final_source
+                if exc_type is not None and issubclass(exc_type, AssertionError) and final_source:
+                    try:
+                        has_exc_text = bool(str(exc_value)) if exc_value is not None else False
+                    except Exception:
+                        has_exc_text = True
+                    if not has_exc_text:
+                        if self._colorize:
+                            final_source = self._syntax_highlighter.highlight(final_source)
+                        error_message += ": " + final_source
 
                 error_message = "\n" + error_message
 
@@ -570,4 +595,6 @@ class ExceptionFormatter:
         return result
 
     def format_exception(self, type_, value, tb, *, from_decorator=False):
-        yield from self._format_exception(value, tb, is_first=True, from_decorator=from_decorator)
+        yield from self._format_exception(
+            value, tb, exc_type=type_, is_first=True, from_decorator=from_decorator
+        )

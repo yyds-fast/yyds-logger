@@ -2,11 +2,14 @@
 
 import inspect
 import logging
+import os
 import sys
 import weakref
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from .i18n import get_message
+from .yyds_loguru._logger import _get_file_and_module
+from .yyds_loguru._recattrs import RecordFile
 
 
 _STD_LEVEL_ALIASES = {
@@ -15,7 +18,7 @@ _STD_LEVEL_ALIASES = {
 }
 
 
-def capture_std_logging(logger, level: str = "DEBUG",
+def capture_std_logging(logger, level: Union[str, int] = "DEBUG",
                         names: Optional[List[str]] = None,
                         clear_existing: bool = False) -> None:
     """Install an intercept handler and save the target logger state."""
@@ -80,7 +83,27 @@ def capture_std_logging(logger, level: str = "DEBUG",
                 while frame and (depth == 0 or frame.f_code.co_filename == log_file):
                     frame = frame.f_back
                     depth += 1
-            bound_logger.opt(depth=depth, exception=record.exc_info).log(
+            target_logger = bound_logger
+            if record.pathname and record.pathname != "(unknown file)" and record.lineno:
+                cached_file, _ = _get_file_and_module(record.pathname)
+                rec_file = (
+                    cached_file
+                    if not record.filename or record.filename == cached_file.name
+                    else RecordFile(record.filename or os.path.basename(record.pathname), record.pathname)
+                )
+                rec_line = record.lineno
+                rec_func = record.funcName or "<unknown>"
+                rec_mod = record.module
+
+                def _apply_std_location(log_record) -> None:
+                    log_record["file"] = rec_file
+                    log_record["line"] = rec_line
+                    log_record["function"] = rec_func
+                    if rec_mod:
+                        log_record["module"] = rec_mod
+
+                target_logger = bound_logger.patch(_apply_std_location)
+            target_logger.opt(depth=depth, exception=record.exc_info).log(
                 level_name, record.getMessage()
             )
 
